@@ -1,0 +1,524 @@
+# Preliminary analysis
+## Empirical distribution of the response variable
+```{r}
+rm(list=ls())
+# global variables
+draw_figure<-F
+# train_ind<-3:5;valid_ind<-2;test_ind<-1
+# train_ind<-3:5;valid_ind<-1;test_ind<-2
+# train_ind<-c(1,2,5);valid_ind<-4;test_ind<-3
+# train_ind<-c(1,2,5);valid_ind<-3;test_ind<-4
+train_ind<-1:3;valid_ind<-4;test_ind<-5 # (used in paper)
+
+# load pre-defined functions; pre-process the data
+source("3_tweedie_bst.R")
+str(dat)
+summary(dat)
+boxplot(log(dat$Sev))
+boxplot(log(dat$ClaimTotal[dat$ClaimTotal>0]))
+barplot(table(dat$ClaimNb))
+vnames_glm<-c("Region", "AreaGLM", "DrivAgeGLM", "BonusMalusGLM", "VehPowerGLM",
+              "VehAgeGLM", "VehBrand", "VehGas")
+vnames_bst<-c("Region", "Area", "Density", "DrivAge", "BonusMalus", "VehPower",
+              "VehAge", "VehBrand", "VehGas")
+```
+
+## Data split (Stratified w.r.t ClaimTotal)
+```{r}
+# stratified split w.r.t. ClaimTotal
+dat_test<-dat[dat$ind==test_ind,]
+dat_valid<-dat[dat$ind==valid_ind,]
+dat_learn<-dat[dat$ind%in%c(train_ind,valid_ind),]
+dat_train<-dat[dat$ind%in%train_ind,]
+```
+
+# BST
+```{r}
+valid_rows<-which(dat_learn$ind==valid_ind)
+vnames_bst
+(lambda0<-mean(dat_learn$Y>0))
+(tau0<-mean(dat_learn$Y[dat_learn$Y>0]))
+alpha0<-1
+M0<-200
+patience<-5
+n_tree_lambda<-1
+maxdepth_lambda<-6
+eta_lambda<-0.3
+n_tree_tau<-1
+maxdepth_tau<-6
+eta_tau<-0.1
+trace<-T
+patience<-5
+```
+
+## BST
+```{r}
+# both
+structure<-"both"
+eb_model_both<-EB_tweedie(dat_learn, valid_rows, vnames_bst,
+                       lambda0, tau0, alpha0, M0,
+                       n_tree_lambda, maxdepth_lambda, eta_lambda,
+                       n_tree_tau, maxdepth_tau, eta_tau,
+                       structure, trace, patience)
+# test prediction
+structure<-"both"
+eb_model<-eb_model_both
+test_mat_n<-as.matrix(rep(1,nrow(dat_test)))
+test_mat_y<-as.matrix(rep(1,nrow(dat_test)))
+if (structure == "lambda"|structure == "both"){
+  test_mat_n<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+if (structure == "tau"| structure == "both"){
+  test_mat_y<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin= rep(log(eb_model$lambda0),nrow(dat_test)))
+dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin= rep(log(eb_model$tau0),nrow(dat_test)))
+for (m in 1:which.min(eb_model$valid_loss)){
+  dat_test$lambda_eb<-predict(eb_model$lambda_models[[m]],newdata =dtest_n)
+  dat_test$lambda_eb_mar<-predict(eb_model$lambda_models[[m]],newdata =dtest_n, outputmargin = T)
+  dat_test$tau_eb<-predict(eb_model$tau_models[[m]],newdata =dtest_y)
+  dat_test$tau_eb_mar<-predict(eb_model$tau_models[[m]],newdata =dtest_y, outputmargin = T)
+  dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin=dat_test$lambda_eb_mar)
+  dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin=dat_test$tau_eb_mar)
+}
+
+# test loss
+dat_test$mu_eb<-dat_test$lambda_eb*dat_test$tau_eb
+dat_test$phi_eb <- (dat_test$lambda_eb)^(1-eb_model$p_hat)*(dat_test$tau_eb)^(2-eb_model$p_hat)/(2-eb_model$p_hat)
+dat_test$logL_eb<- -log(dtweedie(dat_test$Y,xi=eb_model$p_hat,mu=dat_test$mu_eb, phi=dat_test$phi_eb/dat_test$Exposure))
+(loss_test_EB<-mean(dat_test$logL_eb))
+```
+
+## BST-lambda, BST-lambda-tau
+```{r}
+# lambda
+structure<-"lambda"
+eb_model_lambda<-EB_tweedie(dat_learn, valid_rows, vnames_bst,
+                       lambda0, tau0, alpha0, M0,
+                       n_tree_lambda, maxdepth_lambda, eta_lambda,
+                       n_tree_tau, maxdepth_tau, eta_tau,
+                       structure, trace, patience)
+## test prediction
+structure<-"lambda"
+eb_model<-eb_model_lambda
+test_mat_n<-as.matrix(rep(1,nrow(dat_test)))
+test_mat_y<-as.matrix(rep(1,nrow(dat_test)))
+if (structure == "lambda"|structure == "both"){
+  test_mat_n<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+if (structure == "tau"| structure == "both"){
+  test_mat_y<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin= rep(log(eb_model$lambda0),nrow(dat_test)))
+dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin= rep(log(eb_model$tau0),nrow(dat_test)))
+for (m in 1:which.min(eb_model$valid_loss)){
+  dat_test$lambda_eb<-predict(eb_model$lambda_models[[m]],newdata =dtest_n)
+  dat_test$lambda_eb_mar<-predict(eb_model$lambda_models[[m]],newdata =dtest_n, outputmargin = T)
+  dat_test$tau_eb<-predict(eb_model$tau_models[[m]],newdata =dtest_y)
+  dat_test$tau_eb_mar<-predict(eb_model$tau_models[[m]],newdata =dtest_y, outputmargin = T)
+  dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin=dat_test$lambda_eb_mar)
+  dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin=dat_test$tau_eb_mar)
+}
+## test loss
+dat_test$mu_eb<-dat_test$lambda_eb*dat_test$tau_eb
+dat_test$phi_eb <- (dat_test$lambda_eb)^(1-eb_model$p_hat)*(dat_test$tau_eb)^(2-eb_model$p_hat)/(2-eb_model$p_hat)
+dat_test$logL_eb<- -log(dtweedie(dat_test$Y,xi=eb_model$p_hat,mu=dat_test$mu_eb, phi=dat_test$phi_eb/dat_test$Exposure))
+(loss_test_EB_lambda<-mean(dat_test$logL_eb))
+
+# lambda-tau
+lambda0<-eb_model_lambda$lambda_hat
+tau0<-eb_model_lambda$tau_hat
+alpha0<-eb_model_lambda$alpha_hat
+structure<-"tau"
+eb_model_lambda_tau<-EB_tweedie(dat_learn, valid_rows, vnames_bst,
+                       lambda0, tau0, alpha0, M0,
+                       n_tree_lambda, maxdepth_lambda, eta_lambda,
+                       n_tree_tau, maxdepth_tau, eta_tau,
+                       structure, trace, patience)
+## test prediction
+structure<-"tau"
+eb_model<-eb_model_lambda_tau
+test_mat_n<-as.matrix(rep(1,nrow(dat_test)))
+test_mat_y<-as.matrix(rep(1,nrow(dat_test)))
+if (structure == "lambda"|structure == "both"){
+  test_mat_n<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+if (structure == "tau"| structure == "both"){
+  test_mat_y<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin=dat_test$lambda_eb_mar)
+dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin=dat_test$tau_eb_mar)
+for (m in 1:which.min(eb_model$valid_loss)){
+  dat_test$lambda_eb<-predict(eb_model$lambda_models[[m]],newdata =dtest_n)
+  dat_test$lambda_eb_mar<-predict(eb_model$lambda_models[[m]],newdata =dtest_n, outputmargin = T)
+  dat_test$tau_eb<-predict(eb_model$tau_models[[m]],newdata =dtest_y)
+  dat_test$tau_eb_mar<-predict(eb_model$tau_models[[m]],newdata =dtest_y, outputmargin = T)
+  dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin=dat_test$lambda_eb_mar)
+  dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin=dat_test$tau_eb_mar)
+}
+## test loss
+dat_test$mu_eb<-dat_test$lambda_eb*dat_test$tau_eb
+dat_test$phi_eb <- (dat_test$lambda_eb)^(1-eb_model$p_hat)*(dat_test$tau_eb)^(2-eb_model$p_hat)/(2-eb_model$p_hat)
+dat_test$logL_eb<- -log(dtweedie(dat_test$Y,xi=eb_model$p_hat,mu=dat_test$mu_eb, phi=dat_test$phi_eb/dat_test$Exposure))
+(loss_test_EB_lambda_tau<-mean(dat_test$logL_eb))
+```
+
+## BST-tau, BST-tau-lambda
+```{r}
+# tau
+(lambda0<-mean(dat_learn$Y>0))
+(tau0<-mean(dat_learn$Y[dat_learn$Y>0]))
+alpha0<-1
+structure<-"tau"
+eb_model_tau<-EB_tweedie(dat_learn, valid_rows, vnames_bst,
+                       lambda0, tau0, alpha0, M0,
+                       n_tree_lambda, maxdepth_lambda, eta_lambda,
+                       n_tree_tau, maxdepth_tau, eta_tau,
+                       structure, trace, patience)
+## test prediction
+structure<-"tau"
+eb_model<-eb_model_tau
+test_mat_n<-as.matrix(rep(1,nrow(dat_test)))
+test_mat_y<-as.matrix(rep(1,nrow(dat_test)))
+if (structure == "lambda"|structure == "both"){
+  test_mat_n<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+if (structure == "tau"| structure == "both"){
+  test_mat_y<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin= rep(log(eb_model$lambda0),nrow(dat_test)))
+dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin= rep(log(eb_model$tau0),nrow(dat_test)))
+for (m in 1:which.min(eb_model$valid_loss)){
+  dat_test$lambda_eb<-predict(eb_model$lambda_models[[m]],newdata =dtest_n)
+  dat_test$lambda_eb_mar<-predict(eb_model$lambda_models[[m]],newdata =dtest_n, outputmargin = T)
+  dat_test$tau_eb<-predict(eb_model$tau_models[[m]],newdata =dtest_y)
+  dat_test$tau_eb_mar<-predict(eb_model$tau_models[[m]],newdata =dtest_y, outputmargin = T)
+  dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin=dat_test$lambda_eb_mar)
+  dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin=dat_test$tau_eb_mar)
+}
+## test loss
+dat_test$mu_eb<-dat_test$lambda_eb*dat_test$tau_eb
+dat_test$phi_eb <- (dat_test$lambda_eb)^(1-eb_model$p_hat)*(dat_test$tau_eb)^(2-eb_model$p_hat)/(2-eb_model$p_hat)
+dat_test$logL_eb<- -log(dtweedie(dat_test$Y,xi=eb_model$p_hat,mu=dat_test$mu_eb, phi=dat_test$phi_eb/dat_test$Exposure))
+(loss_test_EB_tau<-mean(dat_test$logL_eb))
+
+# tau-lambda
+lambda0<-eb_model_tau$lambda_hat
+tau0<-eb_model_tau$tau_hat
+alpha0<-eb_model_tau$alpha_hat
+structure<-"lambda"
+eb_model_tau_lambda<-EB_tweedie(dat_learn, valid_rows, vnames_bst,
+                       lambda0, tau0, alpha0, M0,
+                       n_tree_lambda, maxdepth_lambda, eta_lambda,
+                       n_tree_tau, maxdepth_tau, eta_tau,
+                       structure, trace, patience)
+## test prediction
+structure<-"lambda"
+eb_model<-eb_model_tau_lambda
+test_mat_n<-as.matrix(rep(1,nrow(dat_test)))
+test_mat_y<-as.matrix(rep(1,nrow(dat_test)))
+if (structure == "lambda"|structure == "both"){
+  test_mat_n<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+if (structure == "tau"| structure == "both"){
+  test_mat_y<-sparse.model.matrix(~., data=dat_test[,vnames_bst])
+}
+dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin=dat_test$lambda_eb_mar)
+dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin=dat_test$tau_eb_mar)
+for (m in 1:which.min(eb_model$valid_loss)){
+  dat_test$lambda_eb<-predict(eb_model$lambda_models[[m]],newdata =dtest_n)
+  dat_test$lambda_eb_mar<-predict(eb_model$lambda_models[[m]],newdata =dtest_n, outputmargin = T)
+  dat_test$tau_eb<-predict(eb_model$tau_models[[m]],newdata =dtest_y)
+  dat_test$tau_eb_mar<-predict(eb_model$tau_models[[m]],newdata =dtest_y, outputmargin = T)
+  dtest_n<-xgb.DMatrix(data=test_mat_n, base_margin=dat_test$lambda_eb_mar)
+  dtest_y<-xgb.DMatrix(data=test_mat_y, base_margin=dat_test$tau_eb_mar)
+}
+## test loss
+dat_test$mu_eb<-dat_test$lambda_eb*dat_test$tau_eb
+dat_test$phi_eb <- (dat_test$lambda_eb)^(1-eb_model$p_hat)*(dat_test$tau_eb)^(2-eb_model$p_hat)/(2-eb_model$p_hat)
+dat_test$logL_eb<- -log(dtweedie(dat_test$Y,xi=eb_model$p_hat,mu=dat_test$mu_eb, phi=dat_test$phi_eb/dat_test$Exposure))
+(loss_test_EB_tau_lambda<-mean(dat_test$logL_eb))
+
+(bst_selection<-
+  data.frame(models=c("BST","BST-lambda","BST-lambda-tau","BST-tau","BST-tau-lambda"), test_loss=round(c(loss_test_EB,loss_test_EB_lambda,loss_test_EB_lambda_tau,
+          loss_test_EB_tau,loss_test_EB_tau_lambda),4)))
+if (draw_figure==T) write.csv(bst_selection, paste("./plots/3-tweedie-bst-selection-",test_ind,".csv",sep=""))
+```
+
+## Variable relative importance
+```{r}
+# variable importance in component mean
+eb_model_L<-eb_model_both
+eb_model_T<-eb_model_both
+var_name<-dimnames(sparse.model.matrix(~., data=dat_valid[,vnames_bst]))[[2]][-1]
+var_ind<-data.frame(var_name=var_name,ind=1:length(var_name))
+importance_lambda<-data.frame(matrix(NA,ncol=length(var_name),
+                              nrow=which.min(eb_model_L$valid_loss)))
+names(importance_lambda)<-var_name
+importance_tau<-data.frame(matrix(NA,ncol=length(var_name),
+                              nrow=which.min(eb_model_T$valid_loss)))
+names(importance_tau)<-var_name
+for (k in 1:which.min(eb_model_L$valid_loss)){
+  boost_lambda<-eb_model_L$lambda_models[[k]]
+  tree_lambda<-xgb.model.dt.tree(model = boost_lambda)
+  gain_lambda<-aggregate(Quality ~ Feature, data=tree_lambda,FUN=sum)
+  gain_lambda<-gain_lambda[-which(gain_lambda$Feature=="Leaf"),]
+  gain_lambda<-merge(var_ind,gain_lambda,by.x="var_name",by.y="Feature",all.x=T)
+  gain_lambda$Quality[which(is.na(gain_lambda$Quality)==T)]<-0
+  importance_lambda[k,]<-gain_lambda$Quality[order(gain_lambda$ind)]
+}
+for (k in 1:which.min(eb_model_T$valid_loss)){
+  boost_tau<-eb_model_T$tau_models[[k]]
+  tree_tau<-xgb.model.dt.tree(model = boost_tau)
+  gain_tau<-aggregate(Quality ~ Feature, data=tree_tau,FUN=sum)
+  gain_tau<-gain_tau[-which(gain_tau$Feature=="Leaf"),]
+  gain_tau<-merge(var_ind,gain_tau,by.x="var_name",by.y="Feature",all.x=T)
+  gain_tau$Quality[which(is.na(gain_tau$Quality)==T)]<-0
+  importance_tau[k,]<-gain_tau$Quality[order(gain_tau$ind)]
+}
+
+(top10_lambda<-round(sort(apply(importance_lambda,2,sum),decreasing=T)/sum(importance_lambda)*100,2)[1:10])
+(top10_tau<-round(sort(apply(importance_tau,2,sum),decreasing=T)/sum(importance_tau)*100,2)[1:10])
+# write.csv(top10_lambda,"./plots/3-top10_lambda.csv")
+# write.csv(top10_tau,"./plots/3-top10_tau.csv")
+```
+
+# GLM
+```{r}
+# Conditional distribution
+condi_n(Y=0,N=0,e=1,lambda=0.25,alpha=1,tau=500)
+condi_n(Y=0,N=1,e=1,lambda=0.25,alpha=1,tau=500)
+condi_n(Y=5000,N=0,e=1,lambda=0.25,alpha=1,tau=500)
+condi_n(Y=5000,N=1,e=1,lambda=0.25,alpha=1,tau=500)
+condi_n(Y=5000,N=4,e=1,lambda=0.25,alpha=1,tau=500)
+M0<-20
+em_model<-EM_tweedie(dat_learn=dat_learn, M0=M0)
+
+# learn loss
+p_em<-(em_model$em_alpha+2)/(em_model$em_alpha+1)
+dat_learn$lambda_em<-predict(em_model$em_poi,newdata =dat_learn, type="response")/dat_learn$Exposure
+dat_learn$tau_em<-predict(em_model$em_gam, newdata = data.frame(dat_learn[,vnames_glm],Exposure=1,ClaimNb=1), type="response")
+dat_learn$mu_em<-dat_learn$lambda_em*dat_learn$tau_em
+dat_learn$phi_em <- dat_learn$lambda_em^(1-p_em)*dat_learn$tau_em^(2-p_em)/(2-p_em)
+dat_learn$logL_em<- -log(dtweedie(dat_learn$Y,xi=p_em,mu=dat_learn$mu_em, phi=dat_learn$phi_em/dat_learn$Exposure))
+(loss_learn_EM<-mean(dat_learn$logL_em))
+
+# test loss
+dat_test$lambda_em<-predict(em_model$em_poi,newdata =dat_test, type="response")/dat_test$Exposure
+dat_test$tau_em<-predict(em_model$em_gam, newdata = data.frame(dat_test[,vnames_glm],Exposure=1,ClaimNb=1), type="response")
+dat_test$mu_em<-dat_test$lambda_em*dat_test$tau_em
+dat_test$phi_em <- dat_test$lambda_em^(1-p_em)*dat_test$tau_em^(2-p_em)/(2-p_em)
+dat_test$logL_em<- -log(dtweedie(dat_test$Y,xi=p_em,mu=dat_test$mu_em, phi=dat_test$phi_em/dat_test$Exposure))
+(loss_test_EM<-mean(dat_test$logL_em))
+
+sum(em_model$dat_aug$cond);nrow(dat_learn)
+# png("./plots/empirical/condi_p.png")
+boxplot(cbind(em_model$dat_aug$cond[em_model$dat_aug$ClaimNb==1],em_model$dat_aug$cond[em_model$dat_aug$ClaimNb==2],em_model$dat_aug$cond[em_model$dat_aug$ClaimNb==3],em_model$dat_aug$cond[em_model$dat_aug$ClaimNb==4],em_model$dat_aug$cond[em_model$dat_aug$ClaimNb==5]),xlab="number of claims",ylab="conditional probabilities")
+# dev.off()
+```
+
+# Tweedie regression (not used in the paper)
+## tw_glm 
+```{r}
+vnames_glm
+# p_est<-tweedie.profile(Y/1000 ~ Region + AreaGLM + DrivAgeGLM + BonusMalusGLM + 
+#         VehPowerGLM  + VehAgeGLM  +  VehBrand + VehGas, 
+#         weights=Exposure, data=dat_learn, link.power = 0, 
+#         do.plot = T, p.vec = seq(1.3,1.7,by=0.1))
+# p_est$L
+# (p_tw<-p_est$p.max)
+p_tw<-1.5347
+tw_glm<-glm(Y ~ Region + AreaGLM + DrivAgeGLM + BonusMalusGLM + VehPowerGLM  +
+                VehAgeGLM  +  VehBrand + VehGas, weights = Exposure,
+              family = tweedie(var.power=p_tw, link.power=0), data = dat_learn, maxit=5000)
+(phi_tw<-summary(tw_glm)$dispersion)
+dat_learn$mu_tw<-fitted(tw_glm)
+dat_learn$phi_tw<-phi_tw
+dat_test$mu_tw<-predict(tw_glm, newdata=dat_test, type="response")
+dat_test$phi_tw<-phi_tw
+dat_learn$logL_tw<--log(dtweedie(dat_learn$Y,xi=p_tw,mu=dat_learn$mu_tw, phi=dat_learn$phi_tw/dat_learn$Exposure))
+(loss_learn_tw_glm<-mean(dat_learn$logL_tw))
+dat_test$logL_tw<--log(dtweedie(dat_test$Y,xi=p_tw,mu=dat_test$mu_tw, phi=dat_test$phi_tw/dat_test$Exposure))
+(loss_test_tw_glm<-mean(dat_test$logL_tw))
+round(summary(tw_glm)$coef,4)
+# write.csv(round(summary(tw_model)$coef,4),"./plots/3_tw_coef.csv")
+```
+
+## tw_bst
+```{r}
+param_tw<-list(max_depth=6, eta =0.1, objective="reg:tweedie", tweedie_variance_power=p_tw)
+vnames_bst
+Y0<-mean(dat_train$Y[dat_train$Y>0])
+train_mat<-Matrix::sparse.model.matrix(~ -1 + ., data = dat_train[,vnames_bst])
+valid_mat<-Matrix::sparse.model.matrix(~ -1 + ., data = dat_valid[,vnames_bst])
+learn_mat<-Matrix::sparse.model.matrix(~ -1 + ., data = dat_learn[,vnames_bst])
+test_mat<-Matrix::sparse.model.matrix(~ -1 + ., data = dat_test[,vnames_bst])
+dtrain_tw<-
+  xgb.DMatrix(data=train_mat, label = dat_train$Y, weight=dat_train$Exposure,
+                        base_margin=rep(log(Y0),nrow(dat_train)))
+dvalid_tw<-
+  xgb.DMatrix(data=valid_mat, label = dat_valid$Y, weight=dat_valid$Exposure,
+                        base_margin=rep(log(Y0),nrow(dat_valid)))
+watchlist_tw=list(train=dtrain_tw, eval= dvalid_tw)
+tw_bst <-
+  xgb.train(param_tw, dtrain_tw, nrounds=500, verbose = 1, watchlist = watchlist_tw, early_stopping_rounds = 5)
+
+# estimated/predicted lambda, tau
+dlearn_tw<-xgb.DMatrix(data=learn_mat, base_margin=rep(log(Y0),nrow(dat_learn)))
+dtest_tw<-xgb.DMatrix(data=test_mat, base_margin=rep(log(Y0),nrow(dat_test)))
+dat_train$mu_tw_bst<-predict(tw_bst,newdata=dtrain_tw,type="response")
+dat_valid$mu_tw_bst<-predict(tw_bst,newdata=dvalid_tw,type="response")
+dat_learn$mu_tw_bst<-predict(tw_bst,newdata=dlearn_tw,type="response")
+dat_test$mu_tw_bst<-predict(tw_bst,newdata=dtest_tw,type="response")
+#(phi_tw_bst<-sum((dat_valid$Y-dat_valid$mu_tw_bst)^2/dat_valid$mu_tw_bst^p_glm)/nrow(dat_valid))
+(phi_tw_bst<-phi_tw)
+dat_learn$phi_tw_bst<-phi_tw_bst
+dat_test$phi_tw_bst<-phi_tw_bst
+dat_learn$logL_tw_bst<--log(dtweedie(dat_learn$Y,xi=p_tw,mu=dat_learn$mu_tw_bst, phi=dat_learn$phi_tw_bst/dat_learn$Exposure))
+(loss_learn_tw_bst<-mean(dat_learn$logL_tw_bst));loss_learn_tw_glm
+dat_test$logL_tw_bst<--log(dtweedie(dat_test$Y,xi=p_tw,mu=dat_test$mu_tw_bst, phi=dat_test$phi_tw_bst/dat_test$Exposure))
+(loss_test_tw_bst<-mean(dat_test$logL_tw_bst));loss_test_tw_glm; loss_test_EM
+```
+
+# N is known
+## NULL
+```{r}
+null_poisson <- 
+  glm(ClaimNb ~ 1   + offset(log(Exposure)), family = poisson(link = "log"),
+      data=dat_learn)
+summary(null_poisson)
+null_gamma<-
+  glm(Y ~ 1 + offset(log(ClaimNb/Exposure)), family=Gamma(link="log"),
+      weights=ClaimNb, data = dat_learn[dat_learn$Y>0,])
+summary(null_gamma)
+
+# estimated/predicted lambda, tau
+dat_learn$lambda_null<-predict(null_poisson,newdata=dat_learn,type="response")/dat_learn$Exposure
+dat_learn$tau_null<-predict(null_gamma,newdata=data.frame(dat_learn,Exposure=1,ClaimNb=1),type="response")
+dat_learn$mu_null<-dat_learn$lambda_null*dat_learn$tau_null
+dat_test$lambda_null<-predict(null_poisson,newdata=dat_test,type="response")/dat_test$Exposure
+dat_test$tau_null<-predict(null_gamma,newdata=data.frame(dat_test, Exposure=1,ClaimNb=1),type="response")
+dat_test$mu_null<-dat_test$lambda_null*dat_test$tau_null
+
+# estimated alpha, p, phi
+yind0<-which(dat_learn$Y>0)
+logL_alpha<-function(alpha){
+    sum((alpha*dat_learn$ClaimNb[yind0]*(log(dat_learn$Y[yind0])-log(dat_learn$tau_null[yind0])+log(alpha*dat_learn$Exposure[yind0]))-alpha*dat_learn$Y[yind0]*dat_learn$Exposure[yind0]/dat_learn$tau_null[yind0]-lgamma(alpha*dat_learn$ClaimNb[yind0])))
+  }
+(alpha_null<- optimise(logL_alpha, maximum = T,interval = c(0, 10))$maximum)
+(p_null <- (alpha_null+2)/(alpha_null+1))
+dat_learn$phi_null<-dat_learn$lambda_null^(1-p_null)*dat_learn$tau_null^(2-p_null)/(2-p_null)
+dat_test$phi_null<-dat_test$lambda_null^(1-p_null)*dat_test$tau_null^(2-p_null)/(2-p_null)
+
+# tweedie learn/test loss
+dat_learn$logL_poi_gam_null<- -log(dtweedie(dat_learn$Y,xi=p_null,mu=dat_learn$mu_null, phi=dat_learn$phi_null/dat_learn$Exposure))
+(loss_learn_poi_gam_null<-mean(dat_learn$logL_poi_gam_null))
+dat_test$logL_poi_gam_null<- -log(dtweedie(dat_test$Y,xi=p_null,mu=dat_test$mu_null, phi=dat_test$phi_null/dat_test$Exposure))
+(loss_test_poi_gam_null<-mean(dat_test$logL_poi_gam_null))
+```
+
+## GLM0
+```{r}
+glm_poisson <-
+  glm(ClaimNb ~ Region + AreaGLM + DrivAgeGLM + BonusMalusGLM + 
+        VehPowerGLM  + VehAgeGLM  +  VehBrand + VehGas   + 
+        offset(log(Exposure)), family = poisson(link = "log"),
+      data=dat_learn)
+summary(glm_poisson)
+glm_gamma<-
+  glm(Y ~ Region + AreaGLM + DrivAgeGLM + BonusMalusGLM + 
+        VehPowerGLM  + VehAgeGLM  +  VehBrand + VehGas +
+        offset(log(ClaimNb/Exposure)), family=Gamma(link="log"),
+      weights=ClaimNb, data = dat_learn[dat_learn$Y>0,])
+summary(glm_gamma)
+
+# estimated/predicted lambda, tau
+dat_learn$lambda_glm<-predict(glm_poisson,newdata=dat_learn,type="response")/dat_learn$Exposure
+dat_test$lambda_glm<-predict(glm_poisson,newdata=dat_test,type="response")/dat_test$Exposure
+dat_learn$tau_glm<-predict(glm_gamma,newdata=data.frame(dat_learn[,vnames_glm],Exposure=1,ClaimNb=1),type="response")
+dat_test$tau_glm<-predict(glm_gamma,newdata=data.frame(dat_test[,vnames_glm],Exposure=1,ClaimNb=1),type="response")
+dat_learn$mu_glm<-dat_learn$lambda_glm*dat_learn$tau_glm
+dat_test$mu_glm<-dat_test$lambda_glm*dat_test$tau_glm
+
+# estimated alpha, p, phi
+yind0<-which(dat_learn$Y>0)
+logL_alpha<-function(alpha){
+    sum((alpha*dat_learn$ClaimNb[yind0]*(log(dat_learn$Y[yind0])-log(dat_learn$tau_glm[yind0])+log(alpha*dat_learn$Exposure[yind0]))-alpha*dat_learn$Y[yind0]*dat_learn$Exposure[yind0]/dat_learn$tau_glm[yind0]-lgamma(alpha*dat_learn$ClaimNb[yind0])))
+  }
+(alpha_glm<- optimise(logL_alpha, maximum = T,interval = c(0, 10))$maximum)
+(p_glm <- (alpha_glm+2)/(alpha_glm+1))
+dat_learn$phi_glm<-dat_learn$lambda_glm^(1-p_glm)*dat_learn$tau_glm^(2-p_glm)/(2-p_glm)
+dat_test$phi_glm<-dat_test$lambda_glm^(1-p_glm)*dat_test$tau_glm^(2-p_glm)/(2-p_glm)
+
+# tweedie learn/test loss
+dat_learn$logL_poi_gam_glm<- -log(dtweedie(dat_learn$Y,xi=p_glm,mu=dat_learn$mu_glm, phi=dat_learn$phi_glm/dat_learn$Exposure))
+(loss_learn_poi_gam_glm<-mean(dat_learn$logL_poi_gam_glm))
+dat_test$logL_poi_gam_glm<- -log(dtweedie(dat_test$Y,xi=p_glm,mu=dat_test$mu_glm, phi=dat_test$phi_glm/dat_test$Exposure))
+(loss_test_poi_gam_glm<-mean(dat_test$logL_poi_gam_glm))
+loss_test_poi_gam_null
+```
+
+## BST0
+```{r}
+(lambda0<-mean(dat_learn$Y>0))
+(tau0<-mean(dat_learn$Y[dat_learn$Y>0]))
+dput(names(dat))
+param_poi<-list(max_depth=6, eta =0.3, objective="count:poisson")
+param_gam<-list(max_depth=6, eta =0.1, objective="reg:gamma")
+train_mat<-Matrix::sparse.model.matrix(~ -1 + ., data = dat_train[,vnames_bst])
+valid_mat<-Matrix::sparse.model.matrix(~ -1 + ., data = dat_valid[,vnames_bst])
+learn_mat<-Matrix::sparse.model.matrix(~ -1 + ., data = dat_learn[,vnames_bst])
+test_mat<-Matrix::sparse.model.matrix(~ -1 + ., data = dat_test[,vnames_bst])
+dtrain_poi<-
+  xgb.DMatrix(data=train_mat, label = dat_train$ClaimNb,
+                        base_margin=log(lambda0*dat_train$Exposure))
+dvalid_poi<-xgb.DMatrix(data=valid_mat, label = dat_valid$ClaimNb,
+                        base_margin=log(lambda0*dat_valid$Exposure))
+
+dtrain_gam<-
+  xgb.DMatrix(data=train_mat[dat_train$Y>0,], label = dat_train$Y[dat_train$Y>0], base_margin=log(tau0*dat_train$ClaimNb[dat_train$Y>0]/dat_train$Exposure[dat_train$Y>0]),
+              weight = dat_train$ClaimNb[dat_train$Y>0])
+dvalid_gam<-
+  xgb.DMatrix(data=valid_mat[dat_valid$Y>0,], label = dat_valid$Y[dat_valid$Y>0], base_margin=log(tau0*dat_valid$ClaimNb[dat_valid$Y>0]/dat_valid$Exposure[dat_valid$Y>0]),
+              weight = dat_valid$ClaimNb[dat_valid$Y>0])
+
+watchlist_poi=list(train=dtrain_poi, eval= dvalid_poi)
+watchlist_gam=list(train=dtrain_gam, eval= dvalid_gam)
+bst_poisson <-
+  xgb.train(param_poi, dtrain_poi, nrounds=200, verbose = 1, watchlist = watchlist_poi, early_stopping_rounds = 5)
+bst_gamma<-
+  xgb.train(param_gam, dtrain_gam, nrounds=200, verbose = 1, watchlist = watchlist_gam, early_stopping_rounds = 5)
+
+# estimated/predicted lambda, tau
+dlearn<-xgb.DMatrix(data=learn_mat, base_margin=rep(0,nrow(dat_learn)))
+dtest<-xgb.DMatrix(data=test_mat, base_margin=rep(0,nrow(dat_test)))
+
+dat_learn$bst_lambda<-predict(bst_poisson,newdata=dlearn,type="response")*lambda0
+dat_learn$bst_tau<-predict(bst_gamma,newdata=dlearn,type="response")*tau0
+dat_test$bst_lambda<-predict(bst_poisson,newdata=dtest,type="response")*lambda0
+dat_test$bst_tau<-predict(bst_gamma,newdata=dtest,type="response")*tau0
+dat_learn$bst_mu<-dat_learn$bst_lambda*dat_learn$bst_tau
+dat_test$bst_mu<-dat_test$bst_lambda*dat_test$bst_tau
+
+# estimated alpha, p, phi
+yind0<-which(dat_learn$Y>0)
+logL_alpha<-function(alpha){
+    sum((alpha*dat_learn$ClaimNb[yind0]*(log(dat_learn$Y[yind0])-log(dat_learn$bst_tau[yind0])+log(alpha*dat_learn$Exposure[yind0]))-alpha*dat_learn$Y[yind0]*dat_learn$Exposure[yind0]/dat_learn$bst_tau[yind0]-lgamma(alpha*dat_learn$ClaimNb[yind0])))
+  }
+(bst_alpha<- optimise(logL_alpha, maximum = T,interval = c(0, 10))$maximum)
+(bst_p <- (bst_alpha+2)/(bst_alpha+1))
+dat_learn$bst_phi<-dat_learn$bst_lambda^(1-bst_p)*dat_learn$bst_tau^(2-bst_p)/(2-bst_p)
+dat_test$bst_phi<-dat_test$bst_lambda^(1-bst_p)*dat_test$bst_tau^(2-bst_p)/(2-bst_p)
+
+# tweedie learn/test loss
+dat_learn$logL_poi_gam_bst<- -log(dtweedie(dat_learn$Y,xi=bst_p,mu=dat_learn$bst_mu, phi=dat_learn$bst_phi/dat_learn$Exposure))
+(loss_learn_poi_gam_bst<-mean(dat_learn$logL_poi_gam_bst))
+loss_learn_poi_gam_glm;loss_learn_poi_gam_null
+dat_test$logL_poi_gam_bst<- -log(dtweedie(dat_test$Y,xi=bst_p,mu=dat_test$bst_mu, phi=dat_test$bst_phi/dat_test$Exposure))
+(loss_test_poi_gam_bst<-mean(dat_test$logL_poi_gam_bst))
+loss_test_poi_gam_glm; loss_test_poi_gam_null
+
+# save results
+(loss_test_sum<-data.frame(models=c("BST","BST-lambda-tau","BST-tau-lambda","GLM","BST0","GLM0","NULL","BST-TW","GLM-TW"),test_loss=round(c(loss_test_EB,loss_test_EB_lambda_tau, loss_test_EB_tau_lambda,loss_test_EM,loss_test_poi_gam_bst,loss_test_poi_gam_glm,loss_test_poi_gam_null,loss_test_tw_bst,loss_test_tw_glm),4)))
+if (draw_figure==T) write.csv(loss_test_sum,paste("./plots/3-test-loss-",test_ind,".csv",sep=""))
+```

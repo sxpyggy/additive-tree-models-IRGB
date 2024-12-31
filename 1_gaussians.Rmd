@@ -1,0 +1,955 @@
+# R code for mixture of experts simulated data
+- using EB algorithm on the original data 
+- faster than the IRGB algorithm
+- user defined multiclass gradient boosting supporting the offsets and weights
+- there are some issues with the base_margin in multiclass xgboost 
+
+# Underlying model and simulated data
+```{r}
+rm(list=ls())
+library(xgboost)
+library(nnet)
+library(rpart)
+library(partykit)
+library(mgcv)
+source("0_multiclass_bst.R")
+source("1_gaussian_bst.R")
+# global variables
+draw_figure=F
+K<-5
+ylim_0<-c(2.25,2.95) # K=5; y range for trace plots of loss
+names(dat)
+names(dat_test)
+
+# true test mse and loss
+(true_test_mse<-mean((dat_test$true_mu-dat_test$Y)^2))
+(true_test_loss<-neg_ll(dat_test$Y,dat_test[,vname2("MU",3)],dat_test[,vname2("SG",3)],dat_test[,vname2("P",3)]))
+
+# histogram of y and boxplot of mu, p
+if (draw_figure==T) png("./plots/1-boxplot_p.png")
+boxplot(dat[,vname2("P",3)],main="Boxplot of mixing probabilities")
+if (draw_figure==T) dev.off()
+boxplot(dat[,vname2("MU",3)],main="Boxplot of component means")
+if (draw_figure==T) png("./plots/1-histogram.png")
+plot(density(dat$Y,width = 2),main="Histogram of Y",xlab="Y",lwd=2)
+abline(v=c(-5,0,5),lty=2,lwd=2)
+if (draw_figure==T) dev.off()
+```
+
+# NULL-5
+```{r}
+X<-dat[, vname2("X",6)]
+Y<-dat$Y
+Xtest<-dat_test[, vname2("X",6)]
+Ytest<-dat_test$Y
+M0<-50
+structure<-"null"
+trace<-T
+patience<-5
+time_temp<-proc.time()
+glm_null<-EM_gaussian(X=X, Y=Y, K=K, M0=M0, structure=structure, trace=trace, patience=patience)
+(proc.time()-time_temp)
+
+# trace plot of loss
+plot(glm_null$learn_loss,type="l",ylim=ylim_0)
+(glm_null_learn_loss <- glm_null$learn_loss[glm_null$iter])
+
+# prediciton on test data
+## test loss
+for (k in 1:K){
+  dat_test[,vname("glm_mu",k)]<-predict(glm_null$mu_models[[k]][[glm_null$iter]],newdata = data.frame(rep(1,nrow(dat_test))))
+  dat_test[,vname("glm_sigma",k)]<-glm_null$sigma[k]
+}
+dat_test[,vname2("glm_p",K)]<-predict(glm_null$p_models[[glm_null$iter]],newdata = data.frame(rep(1,nrow(dat_test))),type="probs")
+(glm_null_test_loss <-neg_ll(Ytest, dat_test[, vname2("glm_mu",K)], dat_test[, vname2("glm_sigma",K)], dat_test[, vname2("glm_p",K)]))
+true_test_loss
+## test mse
+dat_test$glm_mu<-apply((dat_test[,vname2("glm_mu",K)]*dat_test[,vname2("glm_p",K)]),1,sum)
+unique(dat_test$glm_mu);mean(dat$Y)
+(glm_null_test_mse<-mean((dat_test$Y-dat_test$glm_mu)^2))
+(true_test_mse<-mean((dat_test$Y-dat_test$true_mu)^2))
+```
+
+# Boosting
+```{r}
+# data set used in the boosting
+dtest<-xgb.DMatrix(as.matrix(dat_test[,vname2("X",6)]))
+X_ind<-data.frame(X=vname2("X",6),ind=1:6)
+Xtest<-dat_test[,vname2("X",6)]
+Ytest<-dat_test$Y
+X<-dat[,vname2("X",6)]
+Y<-dat$Y
+valid_rows<-8001:10000
+
+# initial values 
+mu00<-quantile(Y,(1:K)/(K+1))
+p00<-rep(1/K,K)
+sigma00<-rep(sd(Y),K)
+
+# hyper-parameters
+M0<-100
+n_tree_mu=1
+maxdepth_mu=2 
+eta_mu =0.1
+n_tree_p=1
+cp_p=0.001
+maxdepth_p=5
+lr_p=0.1
+trace<-T
+patience<-5
+```
+
+## BST-5
+```{r}
+# boosting both component means and mixing probs
+structure<-"both"
+## initial values
+mu0<-matrix(rep(mu00,nrow(X)),ncol=K, byrow=T)
+p0 <-matrix(rep( p00,nrow(X)),ncol=K,byrow = T)
+sigma0<-matrix(rep(sigma00,nrow(X)),ncol=K, byrow=T)
+time_temp<-proc.time()
+bst<-EB_gaussian(X=X, Y=Y, valid_rows, mu0=mu0, p0=p0, sigma0=sigma0, K, M0=M0, n_tree_mu=n_tree_mu, maxdepth_mu=maxdepth_mu, eta_mu=eta_mu, n_tree_p=n_tree_p, cp_p=cp_p, maxdepth_p= maxdepth_p, lr_p=lr_p, structure=structure, trace=trace, patience = patience)
+(proc.time()-time_temp)
+## prediction on test data
+dat_test[,vname2("bst_mu",K)]<-matrix(rep(mu00,nrow(dat_test)),ncol=K,byrow = T)
+dat_test[,vname2("bst_p",K)]<-matrix(rep(p00,nrow(dat_test)),ncol=K,byrow = T)
+dtest_mu<-xgb.DMatrix(as.matrix(dat_test[,vname2("X",6)]))
+dtest_p<-dat_test[,vname2("X",6)]
+for (m in 1:which.min(bst$valid_loss)){
+  for (k in 1:K){
+    dtest_mu<-xgb.DMatrix(as.matrix(dat_test[,vname2("X",6)]), base_margin=dat_test[,vname("bst_mu",k)])
+    dat_test[,vname("bst_mu",k)] <- predict(bst$mu_models[[k]][[m]], newdata = dtest_mu)
+  }
+  dat_test[,vname2("bst_p",K)]<- predict_BST(X=dtest_p, BST_fit= bst$p_models[[m]], init=dat_test[,vname2("bst_p",K)], type="response")
+}
+dat_test[,vname2("bst_sigma",K)]<-matrix(rep(bst$sigma, nrow(dat_test)), ncol=K, byrow = T)
+boxplot(dat_test[,vname2("bst_p",K)])
+boxplot(dat_test[,vname2("bst_mu",K)])
+boxplot(dat_test[,vname2("bst_sigma",K)])
+### test loss
+(bst_test_loss<- neg_ll(dat_test$Y, dat_test[, vname2("bst_mu",K)], dat_test[, vname2("bst_sigma",K)], dat_test[, vname2("bst_p",K)]))
+glm_null_test_loss
+true_test_loss
+### test mse
+dat_test$bst_mean <- apply((dat_test[, vname2("bst_mu",K)]*dat_test[, vname2("bst_p",K)]),1,sum) 
+(bst_test_mse<-mean((dat_test$Y-dat_test$bst_mean)^2))
+true_test_mse
+glm_null_test_mse
+bst$sigma
+## trace plot of loss for bst
+bst_model<-bst
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-bst-trace.png")
+matplot(1:length(bst_model$train_loss), cbind(bst_model$train_loss, bst_model$valid_loss), type="l",xlab = "boosting iterations", ylab="loss", col=c("black","black"), lty=c(1,2), lwd=2,ylim=ylim_0, main=paste("BST-5:","test loss of",round(bst_test_loss,4)))
+abline(v=which.min(bst_model$valid_loss), lty=2, col="black")
+abline(h=c(bst_test_loss,glm_null_test_loss),lty=3:4,col=c("blue","red"),lwd=2)
+legend("topright",c("training loss","validation loss","test loss", "test loss of null model"), col=c("black","black","blue","red"), lty=1:4, lwd=2)
+if (draw_figure==T) dev.off()
+```
+
+## BST-5M, BST-5M-5P
+```{r}
+# boosting component means with homo mixing probs
+structure<-"mu"
+## initial values
+mu0<-matrix(rep(mu00,nrow(X)),ncol=K, byrow=T)
+p0 <-matrix(rep( p00,nrow(X)),ncol=K,byrow = T)
+sigma0<-matrix(rep(sigma00,nrow(X)),ncol=K, byrow=T)
+time_temp<-proc.time()
+bst_m<-EB_gaussian(X=X, Y=Y, valid_rows, mu0=mu0, p0=p0, sigma0=sigma0, K, M0=M0, n_tree_mu=n_tree_mu, maxdepth_mu=maxdepth_mu, eta_mu=eta_mu, n_tree_p=n_tree_p, cp_p=cp_p, maxdepth_p= maxdepth_p, lr_p=lr_p, structure=structure, trace=trace, patience = patience)
+(proc.time()-time_temp)
+## prediction on test data
+dat_test[,vname2("bst_mu",K)]<-matrix(rep(mu00,nrow(dat_test)),ncol=K,byrow = T)
+dat_test[,vname2("bst_p",K)]<-matrix(rep(p00,nrow(dat_test)),ncol=K,byrow = T)
+dtest_mu<-xgb.DMatrix(as.matrix(dat_test[,vname2("X",6)]))
+dtest_p<-data.frame(rep(1,nrow(dat_test)))
+for (m in 1:which.min(bst_m$valid_loss)){
+  for (k in 1:K){
+    dtest_mu<-xgb.DMatrix(as.matrix(dat_test[,vname2("X",6)]), base_margin=dat_test[,vname("bst_mu",k)])
+    dat_test[,vname("bst_mu",k)] <- predict(bst_m$mu_models[[k]][[m]], newdata = dtest_mu)
+  }
+  dat_test[,vname2("bst_p",K)]<- predict_BST(X=dtest_p, BST_fit= bst_m$p_models[[m]], init=dat_test[,vname2("bst_p",K)], type="response")
+}
+dat_test[,vname2("bst_sigma",K)]<-matrix(rep(bst_m$sigma, nrow(dat_test)), ncol=K, byrow = T)
+boxplot(dat_test[,vname2("bst_p",K)])
+boxplot(dat_test[,vname2("bst_mu",K)])
+boxplot(dat_test[,vname2("bst_sigma",K)])
+### test loss
+(bst_m_test_loss<- neg_ll(dat_test$Y, dat_test[, vname2("bst_mu",K)], dat_test[, vname2("bst_sigma",K)], dat_test[, vname2("bst_p",K)]))
+glm_null_test_loss
+true_test_loss
+### test mse
+dat_test$bst_mean <- apply((dat_test[, vname2("bst_mu",K)]*dat_test[, vname2("bst_p",K)]),1,sum) 
+(bst_m_test_mse<-mean((dat_test$Y-dat_test$bst_mean)^2))
+true_test_mse
+glm_null_test_mse
+bst_m$sigma
+## trace plot of loss for bst_m
+bst_model<-bst_m
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-bst_m-trace.png")
+matplot(1:length(bst_model$train_loss), cbind(bst_model$train_loss, bst_model$valid_loss), type="l",xlab = "boosting iterations", ylab="loss", col=c("black","black"), lty=c(1,2), lwd=2,ylim=ylim_0, main=paste("BST-5M:","test loss of",round(bst_m_test_loss,4)))
+abline(v=which.min(bst_model$valid_loss), lty=2, col="black")
+abline(h=c(bst_m_test_loss,glm_null_test_loss),lty=3:4,col=c("blue","red"),lwd=2)
+legend("topright",c("training loss","validation loss","test loss", "test loss of null model"), col=c("black","black","blue","red"), lty=1:4, lwd=2)
+if (draw_figure==T) dev.off()
+
+# mixing probabilities boosting based on bst_m
+structure="p"
+## initial values
+mu0<-bst_m$par_mat[,vname2("mu",K)]
+p0<-bst_m$par_mat[,vname2("p",K)]
+sigma0<-bst_m$par_mat[,vname2("sigma",K)]
+bst_m_p<-EB_gaussian(X=X, Y=Y, valid_rows, mu0=mu0, p0=p0, sigma0=sigma0, K, M0=M0, n_tree_mu=n_tree_mu, maxdepth_mu=maxdepth_mu, eta_mu=eta_mu, n_tree_p=n_tree_p, cp_p=cp_p, maxdepth_p= maxdepth_p, lr_p=lr_p, structure=structure, trace=trace, patience = patience)
+## prediction on test data
+dtest_mu<-xgb.DMatrix(as.matrix(rep(1,nrow(dat_test))))
+dtest_p<-dat_test[,vname2("X",6)]
+for (m in 1:which.min(bst_m_p$valid_loss)){
+  for (k in 1:K){
+    dtest_mu<-xgb.DMatrix(as.matrix(rep(1,nrow(dat_test))), base_margin=dat_test[,vname("bst_mu",k)])
+    dat_test[,vname("bst_mu",k)] <- predict(bst_m_p$mu_models[[k]][[m]], newdata = dtest_mu)
+  }
+  dat_test[,vname2("bst_p",K)]<- predict_BST(X=dtest_p, BST_fit= bst_m_p$p_models[[m]], init=dat_test[,vname2("bst_p",K)], type="response")
+}
+dat_test[,vname2("bst_sigma",K)]<-matrix(rep(bst_m_p$sigma, nrow(dat_test)), ncol=K, byrow = T)
+boxplot(dat_test[,vname2("bst_p",K)])
+boxplot(dat_test[,vname2("bst_mu",K)])
+boxplot(dat_test[,vname2("bst_sigma",K)])
+### test loss
+(bst_m_p_test_loss<- neg_ll(dat_test$Y, dat_test[, vname2("bst_mu",K)], dat_test[, vname2("bst_sigma",K)], dat_test[, vname2("bst_p",K)]))
+bst_m_test_loss
+glm_null_test_loss
+true_test_loss
+### test mse
+dat_test$bst_mean <- apply((dat_test[, vname2("bst_mu",K)]*dat_test[, vname2("bst_p",K)]),1,sum) 
+(bst_m_p_test_mse<-mean((dat_test$Y-dat_test$bst_mean)^2))
+bst_m_test_mse
+glm_null_test_mse
+true_test_mse
+bst_m$sigma
+bst_m_p$sigma
+## trace plot of loss 
+bst_model<-bst_m_p
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-bst_m_p-trace.png")
+matplot(1:length(bst_model$train_loss), cbind(bst_model$train_loss, bst_model$valid_loss), type="l",xlab = "boosting iterations", ylab="loss", col=c("black","black"), lty=c(1,2), lwd=2,ylim=ylim_0, main=paste("BST-5M-5P:","test loss of",round(bst_m_p_test_loss,4)))
+abline(v=which.min(bst_model$valid_loss), lty=2, col="black")
+abline(h=c(bst_m_p_test_loss,glm_null_test_loss),lty=3:4,col=c("blue","red"),lwd=2)
+legend("topright",c("training loss","validation loss","test loss", "test loss of null model"), col=c("black","black","blue","red"), lty=1:4, lwd=2)
+if (draw_figure==T) dev.off()
+```
+
+## BST-5P, BST-5P-5M
+```{r}
+# boosting mixing probs with homo component means
+structure<-"p"
+## initial values
+mu0<-matrix(rep(mu00,nrow(X)),ncol=K, byrow=T)
+p0 <-matrix(rep( p00,nrow(X)),ncol=K,byrow = T)
+sigma0<-matrix(rep(sigma00,nrow(X)),ncol=K, byrow=T)
+time_temp<-proc.time()
+bst_p<-EB_gaussian(X=X, Y=Y, valid_rows, mu0=mu0, p0=p0, sigma0=sigma0, K, M0=M0, n_tree_mu=n_tree_mu, maxdepth_mu=maxdepth_mu, eta_mu=eta_mu, n_tree_p=n_tree_p, cp_p=cp_p, maxdepth_p= maxdepth_p, lr_p=lr_p, structure=structure, trace=trace, patience = patience)
+(proc.time()-time_temp)
+## prediction on test data
+dat_test[,vname2("bst_mu",K)]<-matrix(rep(mu00,nrow(dat_test)),ncol=K,byrow = T)
+dat_test[,vname2("bst_p",K)]<-matrix(rep(p00,nrow(dat_test)),ncol=K,byrow = T)
+dtest_p<-dat_test[,vname2("X",6)]
+for (m in 1:which.min(bst_p$valid_loss)){
+  for (k in 1:K){
+    dtest_mu<-xgb.DMatrix(as.matrix(rep(1,nrow(dat_test))), base_margin=dat_test[,vname("bst_mu",k)])
+    dat_test[,vname("bst_mu",k)] <- predict(bst_p$mu_models[[k]][[m]], newdata = dtest_mu)
+  }
+  dat_test[,vname2("bst_p",K)]<- predict_BST(X=dtest_p, BST_fit= bst_p$p_models[[m]], init=dat_test[,vname2("bst_p",K)], type="response")
+}
+dat_test[,vname2("bst_sigma",K)]<-matrix(rep(bst_p$sigma, nrow(dat_test)), ncol=K, byrow = T)
+boxplot(dat_test[,vname2("bst_mu",K)])
+boxplot(dat_test[,vname2("bst_p",K)])
+boxplot(dat_test[,vname2("bst_sigma",K)])
+### test loss
+(bst_p_test_loss<- neg_ll(dat_test$Y, dat_test[, vname2("bst_mu",K)], dat_test[, vname2("bst_sigma",K)], dat_test[, vname2("bst_p",K)]))
+# bst_m_p_test_loss
+glm_null_test_loss
+true_test_loss
+### test mse
+dat_test$bst_mean_5P <- apply((dat_test[, vname2("bst_mu",K)]*dat_test[, vname2("bst_p",K)]),1,sum) 
+(bst_p_test_mse<-mean((dat_test$Y-dat_test$bst_mean_5P)^2))
+# bst_m_p_test_mse
+glm_null_test_mse
+true_test_mse
+bst_p$sigma
+## trace plot of loss for data
+bst_model<-bst_p
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-bst_p-trace.png")
+matplot(1:length(bst_model$train_loss), cbind(bst_model$train_loss, bst_model$valid_loss), type="l",xlab = "boosting iterations", ylab="loss", col=c("black","black"), lty=c(1,2), lwd=2,ylim=ylim_0, main=paste("BST-5P:","test loss of",round(bst_p_test_loss,4)))
+abline(v=which.min(bst_model$valid_loss), lty=2, col="black")
+abline(h=c(bst_p_test_loss,glm_null_test_loss),lty=3:4,col=c("blue","red"),lwd=2)
+legend("topright",c("training loss","validation loss","test loss", "test loss of null model"), col=c("black","black","blue","red"), lty=1:4, lwd=2)
+if (draw_figure==T) dev.off()
+
+# component mean boosting based on bst_p
+structure<-"mu"
+## initial values
+mu0<-bst_p$par_mat[,vname2("mu",K)]
+p0<-bst_p$par_mat[,vname2("p",K)]
+sigma0<-bst_p$par_mat[,vname2("sigma",K)]
+time_temp<-proc.time()
+bst_p_m<-EB_gaussian(X=X, Y=Y, valid_rows, mu0=mu0, p0=p0, sigma0=sigma0, K, M0=M0, n_tree_mu=n_tree_mu, maxdepth_mu=maxdepth_mu, eta_mu=eta_mu, n_tree_p=n_tree_p, cp_p=cp_p, maxdepth_p= maxdepth_p, lr_p=lr_p, structure=structure, trace=trace, patience = patience)
+## prediction on test data
+dtest_p<-data.frame(rep(1,nrow(dat_test)))
+for (m in 1:which.min(bst_p_m$valid_loss)){
+  for (k in 1:K){
+    dtest_mu<-xgb.DMatrix(as.matrix(dat_test[,vname2("X",6)]), base_margin=dat_test[,vname("bst_mu",k)])
+    dat_test[,vname("bst_mu",k)] <- predict(bst_p_m$mu_models[[k]][[m]], newdata = dtest_mu)
+  }
+  dat_test[,vname2("bst_p",K)]<- predict_BST(X=dtest_p, BST_fit= bst_p_m$p_models[[m]], init=dat_test[,vname2("bst_p",K)], type="response")
+}
+dat_test[,vname2("bst_sigma",K)]<-matrix(rep(bst_p_m$sigma, nrow(dat_test)), ncol=K, byrow = T)
+boxplot(dat_test[,vname2("bst_mu",K)])
+boxplot(dat_test[,vname2("bst_p",K)])
+boxplot(dat_test[,vname2("bst_sigma",K)])
+### test loss
+(bst_p_m_test_loss<- neg_ll(dat_test$Y, dat_test[, vname2("bst_mu",K)], dat_test[, vname2("bst_sigma",K)], dat_test[, vname2("bst_p",K)]))
+bst_p_test_loss
+glm_null_test_loss
+true_test_loss
+### test mse
+dat_test$bst_mean <- apply((dat_test[, vname2("bst_mu",K)]*dat_test[, vname2("bst_p",K)]),1,sum) 
+(bst_p_m_test_mse<-mean((dat_test$Y-dat_test$bst_mean)^2))
+bst_p_test_mse
+glm_null_test_mse
+true_test_mse
+bst_p$sigma
+bst_p_m$sigma
+## trace plot of loss for data
+bst_model<-bst_p_m
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-bst_p_m-trace.png")
+matplot(1:length(bst_model$train_loss), cbind(bst_model$train_loss, bst_model$valid_loss), type="l",xlab = "boosting iterations", ylab="loss", col=c("black","black"), lty=c(1,2), lwd=2,ylim=ylim_0, main=paste("BST-5P-5M:","test loss of",round(bst_p_m_test_loss,4)))
+abline(v=which.min(bst_model$valid_loss), lty=2, col="black")
+abline(h=c(bst_p_m_test_loss,glm_null_test_loss),lty=3:4,col=c("blue","red"),lwd=2)
+legend("topright",c("training loss","validation loss","test loss", "test loss of null model"), col=c("black","black","blue","red"), lty=1:4, lwd=2)
+if (draw_figure==T) dev.off()
+```
+
+### Relative importance (BST-5P)
+```{r}
+bst_model<-bst_p
+# Mixing probabilities
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-boxplot-p-fitted5.png")
+boxplot(bst_model$par_mat[ ,vname2("p",K)],main="BST-5P: Fitted mixing probabilities")
+if (draw_figure==T) dev.off()
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-boxplot-mu-fitted5.png")
+boxplot(bst_model$par_mat[ ,vname2("mu",K)],main="BST-5P: Fitted component means")
+if (draw_figure==T) dev.off()
+round(cor(bst_model$par_mat[ ,vname2("p",K)]),2)
+vi_p<-array(0,dim=c(K,length(bst_model$p_models),ncol(X)))
+X_ind<-data.frame(X=vname2("X",6),ind=1:6)
+for (k in 1:K){
+  for (m in 1: length(bst_model$p_models)){
+    vi_temp<-bst_model$p_models[[m]]$Tree_rpart[[1]][[k]]$variable.importance
+    if (length(vi_temp)>0){
+      for (i in 1:length(vi_temp)){
+        vi_p[k,m,X_ind$X==names(vi_temp)[i]]<-vi_temp[i]
+      }
+    }
+  }
+}
+## variable relative importance in each G
+vi_p_k<-matrix(0,ncol=K,nrow=6)
+for (k in 1:K){
+  vi_p_k[,k]<-apply(vi_p[k,,],2,sum)
+}
+ylim_bar<-c(0,max(vi_p_k))
+par(mfrow=c(2,2))
+for (k in 1:K){
+  if (draw_figure==T) png(paste(c("./plots/1-mixing-prob-imp5-"),k,c(".png"),sep=""))
+  barplot(vi_p_k[,k],names.arg =  vname2("X",6), ylab="relative importance", main=paste("BST-5P: Relative importance in G",k,sep=""), ylim = ylim_bar)
+  box()
+  if (draw_figure==T) dev.off()
+}
+## total variable relative importance
+par(mfrow=c(1,1))
+if (draw_figure==T)  png("./plots/1-mixing-prob-imp-total5.png")
+barplot(apply(vi_p_k,1,sum),names.arg =  vname2("X",6),ylab="relative importance",main="BST-5P: Total relative importance in G's")
+box()
+if (draw_figure==T) dev.off()
+## trace plot of squared loss reduction
+vi_p_trace<-matrix(0,ncol=K,nrow=length(bst_model$p_models))
+for (k in 1:K){
+  vi_p_trace[,k]<-apply(vi_p[k,,],1,sum)
+}
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-mixing-prob-loss-track5.png")
+matplot(vi_p_trace,type="l",xlab="EB iterations", ylab="squared error reduction",col=1:K,lty = 1:K, main="BST-5P: Squared error reduction of gradients in G's",lwd=2)
+legend("topright",vname2("G",K),col=1:K,lty = 1:K,lwd=2)
+if (draw_figure==T) dev.off()
+```
+
+### Relative importance (BST-5P-5M)
+```{r}
+# Component means
+bst_model<-bst_p_m
+par(mfrow=c(1,1))
+boxplot(bst_model$par_mat[ ,vname2("mu",K)])
+round(cor(bst_model$par_mat[ ,vname2("mu",K)]),2)
+vi_mu<-array(0,dim=c(K,length(bst_model$mu_models[[1]]),ncol(X)))
+for (k in 1:K){
+  for (m in 1:length(bst_model$mu_models[[1]])){
+    boost_model<-bst_model$mu_models[[k]][[m]]
+    tree_bst<- tryCatch(xgb.model.dt.tree(model = boost_model), error = function(e) NULL)
+    if (is.null(tree_bst)==F){
+    gain_mat<-aggregate(Quality ~ Feature, data=tree_bst, FUN=sum)
+    gain_mat<-gain_mat[-which(gain_mat$Feature=="Leaf"),]
+    gain_mat<-merge(X_ind,gain_mat,by.x="X",by.y="Feature",all.x=T)
+    gain_mat$Quality[is.na(gain_mat$Quality)]<-0
+    vi_mu[k,m,]<-gain_mat$Quality[order(gain_mat$ind)]
+    }
+  }
+}
+## variable relative importance in each component means
+vi_mu_k<-matrix(0,ncol=K,nrow=6)
+for (k in 1:K){
+  vi_mu_k[,k]<-apply(vi_mu[k,,],2,sum)
+}
+ylim_bar<-c(0,max(vi_mu_k))
+par(mfrow=c(2,2))
+for (k in 1:K){
+  if (draw_figure==T) png(paste(c("./plots/1-mu-imp-"),k,c(".png"),sep=""))
+  barplot(vi_mu_k[,k],names.arg =  vname2("X",6), ylab="relative importance", main=paste("relative importance in mu",k,sep=""), ylim = ylim_bar)
+  box()
+  if (draw_figure==T) dev.off()
+}
+## total variable relative importance
+par(mfrow=c(1,1))
+if (draw_figure==T)  png("./plots/1-mu-imp-total.png")
+barplot(apply(vi_mu_k,1,sum),names.arg =  vname2("X",6),ylab="relative importance",main="relative importance of covariates in component means")
+box()
+if (draw_figure==T) dev.off()
+## trace plot of squared loss reduction
+vi_mu_trace<-matrix(0,ncol=K,nrow=length(bst_model$p_models))
+for (k in 1:K){
+  vi_mu_trace[,k]<-apply(vi_mu[k,,],1,sum)
+}
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-mu-loss-track.png")
+matplot(vi_mu_trace,type="l",xlab="boosting iterations",ylab="squared loss reduction",col=1:K,lty = 1:K)
+legend("topright",vname2("mu",K),col=1:K,lty = 1:K)
+if (draw_figure==T) dev.off()
+```
+
+## BST-3P
+```{r}
+K=3
+structure<-"p"
+# initial values
+mu00<-quantile(Y,(1:K)/(K+1))
+p00<-rep(1/K,K)
+sigma00<-rep(sd(Y),K)
+mu0<-matrix(rep(mu00,nrow(X)),ncol=K, byrow=T)
+p0 <-matrix(rep( p00,nrow(X)),ncol=K,byrow = T)
+sigma0<-matrix(rep(sigma00,nrow(X)),ncol=K, byrow=T)
+bst_p3<-EB_gaussian(X=X, Y=Y, valid_rows, mu0=mu0, p0=p0, sigma0=sigma0, K, M0=M0, n_tree_mu=n_tree_mu, maxdepth_mu=maxdepth_mu, eta_mu=eta_mu, n_tree_p=n_tree_p, cp_p=cp_p, maxdepth_p= maxdepth_p, lr_p=lr_p, structure=structure, trace=trace, patience = patience)
+# prediction on test data
+dat_test[,vname2("bst_mu",K)]<-matrix(rep(mu00,nrow(dat_test)),ncol=K,byrow = T)
+dat_test[,vname2("bst_p",K)]<-matrix(rep(p00,nrow(dat_test)),ncol=K,byrow = T)
+dtest_p<-dat_test[,vname2("X",6)]
+for (m in 1:length(bst_p3$train_loss)){
+  for (k in 1:K){
+    dtest_mu<-xgb.DMatrix(as.matrix(rep(1,nrow(dat_test))), base_margin=dat_test[,vname("bst_mu",k)])
+    dat_test[,vname("bst_mu",k)] <- predict(bst_p3$mu_models[[k]][[m]], newdata = dtest_mu)
+  }
+  dat_test[,vname2("bst_p",K)]<- predict_BST(X=dtest_p, BST_fit= bst_p3$p_models[[m]], init=dat_test[,vname2("bst_p",K)], type="response")
+}
+dat_test[,vname2("bst_sigma",K)]<-matrix(rep(bst_p3$sigma, nrow(dat_test)), ncol=K, byrow = T)
+boxplot(dat_test[,vname2("bst_mu",K)])
+boxplot(dat_test[,vname2("bst_p",K)])
+boxplot(dat_test[,vname2("bst_sigma",K)])
+### test loss
+(bst_p_test_loss3<- neg_ll(dat_test$Y, dat_test[, vname2("bst_mu",K)], dat_test[, vname2("bst_sigma",K)], dat_test[, vname2("bst_p",K)]))
+bst_p_test_loss
+glm_null_test_loss
+true_test_loss
+### test mse
+dat_test$bst_mu_3P <- apply((dat_test[, vname2("bst_mu",K)]*dat_test[, vname2("bst_p",K)]),1,sum) 
+(bst_p_test_mse3<-mean((dat_test$Y-dat_test$bst_mu_3P)^2))
+bst_m_p_test_mse
+bst_p_test_mse
+glm_null_test_mse
+true_test_mse
+bst_p3$sigma
+```
+
+### Relative importance (BST-3P)
+```{r}
+bst_model<-bst_p3
+# Mixing probabilities
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-boxplot-p-fitted3.png")
+boxplot(bst_model$par_mat[ ,vname2("p",K)], main="BST-3P: Fitted mixing probabilities")
+if (draw_figure==T) dev.off()
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-boxplot-mu-fitted3.png")
+boxplot(bst_model$par_mat[ ,vname2("mu",K)], main="BST-3P: Fitted component means")
+if (draw_figure==T) dev.off()
+round(cor(bst_model$par_mat[ ,vname2("p",K)]),2)
+vi_p<-array(0,dim=c(K,length(bst_model$p_models),ncol(X)))
+X_ind<-data.frame(X=vname2("X",6),ind=1:6)
+for (k in 1:K){
+  for (m in 1: length(bst_model$p_models)){
+    vi_temp<-bst_model$p_models[[m]]$Tree_rpart[[1]][[k]]$variable.importance
+    if (length(vi_temp)>0){
+      for (i in 1:length(vi_temp)){
+        vi_p[k,m,X_ind$X==names(vi_temp)[i]]<-vi_temp[i]
+      }
+    }
+  }
+}
+## variable relative importance in each G
+vi_p_k<-matrix(0,ncol=K,nrow=6)
+for (k in 1:K){
+  vi_p_k[,k]<-apply(vi_p[k,,],2,sum)
+}
+ylim_bar<-c(0,max(vi_p_k))
+par(mfrow=c(2,2))
+for (k in 1:K){
+  if (draw_figure==T) png(paste(c("./plots/1-mixing-prob-imp3-"),k,c(".png"),sep=""))
+  barplot(vi_p_k[,k],names.arg =  vname2("X",6), ylab="relative importance", main=paste("BST-3P: Relative importance in G",k,sep=""), ylim = ylim_bar)
+  box()
+  if (draw_figure==T) dev.off()
+}
+## total variable relative importance
+par(mfrow=c(1,1))
+if (draw_figure==T)  png("./plots/1-mixing-prob-imp-total3.png")
+barplot(apply(vi_p_k,1,sum),names.arg =  vname2("X",6),ylab="relative importance",main="BST-3P: Total relative importance in G's")
+box()
+if (draw_figure==T) dev.off()
+## trace plot of squared loss reduction
+vi_p_trace<-matrix(0,ncol=K,nrow=length(bst_model$p_models))
+for (k in 1:K){
+  vi_p_trace[,k]<-apply(vi_p[k,,],1,sum)
+}
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/1-mixing-prob-loss-track3.png")
+matplot(vi_p_trace,type="l",xlab="EB iterations", ylab="squared error reduction",col=1:K,lty = 1:K, main="BST-3P: Squared error reduction of gradients in G's",lwd=2)
+legend("topright",vname2("G",K),col=1:K,lty = 1:K,lwd=2)
+if (draw_figure==T) dev.off()
+```
+
+## BST-3
+```{r}
+structure<-"both"
+# initial values
+mu0<-matrix(rep(mu00,nrow(X)),ncol=K, byrow=T)
+p0 <-matrix(rep( p00,nrow(X)),ncol=K,byrow = T)
+sigma0<-matrix(rep(sigma00,nrow(X)),ncol=K, byrow=T)
+time_temp<-proc.time()
+bst_mp<-EB_gaussian(X=X, Y=Y, valid_rows, mu0=mu0, p0=p0, sigma0=sigma0, K, M0=M0, n_tree_mu=n_tree_mu, maxdepth_mu=maxdepth_mu, eta_mu=eta_mu, n_tree_p=n_tree_p, cp_p=cp_p, maxdepth_p= maxdepth_p, lr_p=lr_p, structure=structure, trace=trace, patience = patience)
+time_bst_mp<-(proc.time()-time_temp)[3]
+# prediction on test data
+dat_test[,vname2("bst_mu",K)]<-matrix(rep(mu00,nrow(dat_test)),ncol=K,byrow = T)
+dat_test[,vname2("bst_p",K)]<-matrix(rep(p00,nrow(dat_test)),ncol=K,byrow = T)
+dtest_p<-dat_test[,vname2("X",6)]
+for (m in 1:length(bst_mp$train_loss)){
+  for (k in 1:K){
+    if (structure=="both") dtest_mu<-xgb.DMatrix(as.matrix(dat_test[,vname2("X",6)]), base_margin=dat_test[,vname("bst_mu",k)])
+    if (structure=="p") dtest_mu<-xgb.DMatrix(as.matrix(rep(1,nrow(dat_test))), base_margin=dat_test[,vname("bst_mu",k)])
+    dat_test[,vname("bst_mu",k)] <- predict(bst_mp$mu_models[[k]][[m]], newdata = dtest_mu)
+  }
+  dat_test[,vname2("bst_p",K)]<- predict_BST(X=dtest_p, BST_fit= bst_mp$p_models[[m]], init=dat_test[,vname2("bst_p",K)], type="response")
+}
+dat_test[,vname2("bst_sigma",K)]<-matrix(rep(bst_mp$sigma, nrow(dat_test)), ncol=K, byrow = T)
+## test loss
+(bst_mp_test_loss<- neg_ll(dat_test$Y, dat_test[, vname2("bst_mu",K)], dat_test[, vname2("bst_sigma",K)], dat_test[, vname2("bst_p",K)]))
+bst_p_test_loss3
+glm_null_test_loss
+true_test_loss
+## test mse
+dat_test$bst_mu_3 <- apply((dat_test[, vname2("bst_mu",K)]*dat_test[, vname2("bst_p",K)]),1,sum) 
+(bst_mp_test_mse<-mean((dat_test$Y-dat_test$bst_mu_3)^2))
+true_test_mse
+bst_mp$sigma
+```
+
+### Trace plot of loss (not used in paper)
+```{r,eval=F}
+draw_figure<-F
+bst_model<-bst_mp
+# trace plot of loss for data
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/loss-bst.png")
+matplot(1:length(bst_model$train_loss), cbind(bst_model$train_loss, bst_model$valid_loss), type="l",xlab = "boosting iterations", ylab="loss", col=c("red","blue"), lty=c(1,2), lwd=1.5,ylim=ylim_0, main="trace plot of loss for data")
+abline(v=which.min(bst_model$valid_loss), lty=2, col="blue")
+legend("topright",c("training loss","validation loss"), col=c("red","blue"), lty=c(1,2), lwd=1.5)
+if (draw_figure==T) dev.off()
+
+# trace plot of loss for mixing probabilities
+p_model_train_loss<-bst_model$p_models[[1]]$Train_loss
+p_model_valid_loss<-bst_model$p_models[[1]]$Valid_loss
+for (m in 2:length(bst_model$train_loss)){
+  p_model_train_loss<-c(p_model_train_loss,bst_model$p_models[[m]]$Train_loss)
+  p_model_valid_loss<-c(p_model_valid_loss,bst_model$p_models[[m]]$Valid_loss)}
+par(mfrow=c(1,1))
+matplot(1:length(p_model_train_loss), cbind(p_model_train_loss,p_model_valid_loss), type="l", xlab = "EB iterations", ylab="loss", col=c("red","blue"), lty=1:2, lwd=1.5, main="trace plot of loss for mixing probabilities")
+legend("topright",c("training loss","validation loss"),col=c("red","blue"),lty=1:2,lwd=1.5)
+abline(v=which.min(p_model_train_loss),lty=1,col="red")
+abline(v=which.min(p_model_valid_loss),lty=2,col="blue")
+
+# trace plot of loss for each component mean
+par(mfrow=c(2,2))
+for (k in 1:K){
+  mu_model_train_loss<-bst_model$mu_models[[k]][[1]]$evaluation_log$train_rmse
+  mu_model_valid_loss<-bst_model$mu_models[[k]][[1]]$evaluation_log$eval_rmse
+  for (m in 2:length(bst_model$train_loss)){
+    mu_model_train_loss<-c(mu_model_train_loss, bst_model$mu_models[[k]][[m]]$evaluation_log$train_rmse)
+    mu_model_valid_loss<-c(mu_model_valid_loss, bst_model$mu_models[[k]][[m]]$evaluation_log$eval_rmse)
+  }
+  matplot(1:length(mu_model_train_loss), cbind(mu_model_train_loss, mu_model_valid_loss), type="l", xlab = "EB iterations", ylab="loss", col=c("red","blue"), lty=1:2, lwd=1.5,main=paste("trace plot for mu",k,sep=""))
+  legend("topright",c("training loss","validation loss"), col=c("red","blue"), lty=1:2, lwd=1.5)
+  abline(v=which.min(mu_model_train_loss), lty=1, col="red")
+  abline(v=which.min(mu_model_valid_loss), lty=2, col="blue")
+}
+```
+
+### Relative importance (not used in paper)
+```{r,eval=F}
+draw_figure<-F
+# Mixing probabilities
+## boxplot of mixing probs
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/boxplot-fitted-p.png")
+boxplot(bst_model$par_mat[ ,vname2("p",K)])
+if (draw_figure==T) dev.off()
+round(cor(bst_model$par_mat[ ,vname2("p",K)]),2)
+vi_p<-array(0,dim=c(K,length(bst_model$p_models),ncol(X)))
+X_ind<-data.frame(X=vname2("X",6),ind=1:6)
+for (k in 1:K){
+  for (m in 1: length(bst_model$p_models)){
+    vi_temp<-bst_model$p_models[[m]]$Tree_rpart[[1]][[k]]$variable.importance
+    if (length(vi_temp)>0){
+      for (i in 1:length(vi_temp)){
+        vi_p[k,m,X_ind$X==names(vi_temp)[i]]<-vi_temp[i]
+      }
+    }
+  }
+}
+## variable relative importance in each G
+vi_p_k<-matrix(0,ncol=K,nrow=6)
+for (k in 1:K){
+  vi_p_k[,k]<-apply(vi_p[k,,],2,sum)
+}
+ylim_bar<-range(vi_p_k)
+par(mfrow=c(2,2))
+for (k in 1:K){
+  if (draw_figure==T) png(paste(c("./plots/mixing-prob-imp-"),k,c(".png"),sep=""))
+  barplot(vi_p_k[,k],names.arg =  vname2("X",6), ylab="relative importance", main=paste("relative importance in G",k,sep=""), ylim = ylim_bar)
+  box()
+  if (draw_figure==T) dev.off()
+}
+## total variable relative importance in mixing probs
+par(mfrow=c(1,1))
+if (draw_figure==T)  png("./plots/mixing-prob-imp-total.png")
+barplot(apply(vi_p_k,1,sum),names.arg =  vname2("X",6),ylab="relative importance",main="relative importance of covariates in mixing probabilities")
+box()
+if (draw_figure==T) dev.off()
+## trace plot of squared loss reduction
+vi_p_trace<-matrix(0,ncol=K,nrow=length(bst_model$p_models))
+for (k in 1:K){
+  vi_p_trace[,k]<-apply(vi_p[k,,],1,sum)
+}
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/mixing-prob-loss-track.png")
+matplot(vi_p_trace,type="l",xlab="EB iterations", ylab="squared loss reduction",col=1:K,lty = 1:K)
+legend("topright",vname2("F",K),col=1:K,lty = 1:K)
+if (draw_figure==T) dev.off()
+
+# Component mean
+## boxplot of component means
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/boxplot-mu-fitted.png")
+boxplot(bst_model$par_mat[ ,vname2("mu",K)])
+if (draw_figure==T) dev.off()
+round(cor(bst_model$par_mat[ ,vname2("mu",K)]),2)
+vi_mu<-array(0,dim=c(K,length(bst_model$mu_models[[1]]),ncol(X)))
+for (k in 1:K){
+  for (m in 1:length(bst_model$mu_models[[1]])){
+    boost_model<-bst_model$mu_models[[k]][[m]]
+    tree_bst<- tryCatch(xgb.model.dt.tree(model = boost_model), error = function(e) NULL)
+    if (is.null(tree_bst)==F){
+    gain_mat<-aggregate(Quality ~ Feature, data=tree_bst, FUN=sum)
+    gain_mat<-gain_mat[-which(gain_mat$Feature=="Leaf"),]
+    gain_mat<-merge(X_ind,gain_mat,by.x="X",by.y="Feature",all.x=T)
+    gain_mat$Quality[is.na(gain_mat$Quality)]<-0
+    vi_mu[k,m,]<-gain_mat$Quality[order(gain_mat$ind)]
+    }
+  }
+}
+## variable relative importance in each component mean
+vi_mu_k<-matrix(0,ncol=K,nrow=6)
+for (k in 1:K){
+  vi_mu_k[,k]<-apply(vi_mu[k,,],2,sum)
+}
+ylim_bar<-range(vi_mu_k)
+par(mfrow=c(2,2))
+for (k in 1:K){
+  if (draw_figure==T) png(paste(c("./plots/mu-imp-"),k,c(".png"),sep=""))
+  barplot(vi_mu_k[,k],names.arg =  vname2("X",6), ylab="relative importance", main=paste("relative importance in mu",k,sep=""), ylim = ylim_bar)
+  box()
+  if (draw_figure==T) dev.off()
+}
+## total variable relative importance in component mean
+par(mfrow=c(1,1))
+if (draw_figure==T)  png("./plots/mu-imp-total.png")
+barplot(apply(vi_mu_k,1,sum),names.arg =  vname2("X",6),ylab="relative importance",main="relative importance of covariates in component means")
+box()
+if (draw_figure==T) dev.off()
+## trace plot of squared loss reduction
+vi_mu_trace<-matrix(0,ncol=K,nrow=length(bst_model$p_models))
+for (k in 1:K){
+  vi_mu_trace[,k]<-apply(vi_mu[k,,],1,sum)
+}
+par(mfrow=c(1,1))
+if (draw_figure==T) png("./plots/mu-loss-track.png")
+matplot(vi_mu_trace,type="l",xlab="EB iterations",ylab="squared loss reduction",col=1:K,lty = 1:K)
+legend("topright",vname2("mu",K),col=1:K,lty = 1:K)
+if (draw_figure==T) dev.off()
+```
+
+# GLMs (K=3)
+## NULL-3
+```{r}
+K=3
+X<-dat[, vname2("X",6)]
+Y<-dat$Y
+Xtest<-dat_test[, vname2("X",6)]
+Ytest<-dat_test$Y
+M0<-35
+structure<-"null"
+trace<-T
+patience<-M0
+time_temp<-proc.time()
+glm_null3<-EM_gaussian(X=X, Y=Y, K=K, M0=M0, structure=structure, trace=trace, patience=patience)
+(proc.time()-time_temp)
+
+# trace plot of loss
+plot(glm_null3$learn_loss,type="l",ylim=ylim_0)
+(glm_null_learn_loss3 <- glm_null3$learn_loss[glm_null3$iter])
+
+# prediciton on test data
+## test loss
+for (k in 1:K){
+  dat_test[,vname("glm_mu",k)]<-predict(glm_null3$mu_models[[k]][[glm_null3$iter]],newdata = data.frame(rep(1,nrow(dat_test))))
+  dat_test[,vname("glm_sigma",k)]<-glm_null3$sigma[k]
+}
+dat_test[,vname2("glm_p",K)]<-predict(glm_null3$p_models[[glm_null$iter]],newdata = data.frame(rep(1,nrow(dat_test))),type="probs")
+(glm_null_test_loss3 <-neg_ll(Ytest, dat_test[, vname2("glm_mu",K)], dat_test[, vname2("glm_sigma",K)], dat_test[, vname2("glm_p",K)]))
+glm_null_test_loss
+true_test_loss
+## test mse
+dat_test$glm_mu<-apply((dat_test[,vname2("glm_mu",K)]*dat_test[,vname2("glm_p",K)]),1,sum)
+unique(dat_test$glm_mu);mean(dat$Y)
+(glm_null_test_mse3<-mean((dat_test$Y-dat_test$glm_mu)^2))
+glm_null_test_mse
+```
+
+## GLM-3 (BST-3 counterpart, not used in paper)
+```{r, eval=F}
+X<-dat[,vname2("X",6)]
+Y<-dat$Y
+Xtest<-dat_test[,vname2("X",6)]
+Ytest<-dat_test$Y
+structure<-"both"
+trace<-T
+time_temp<-proc.time()
+glm_mp<-EM_gaussian(X=X, Y=Y, K=K, M0=M0, structure=structure, trace=trace, patience=patience)
+(proc.time()-time_temp)
+
+# trace plot of loss
+plot(glm_mp$learn_loss,type="l",ylim=ylim_0)
+(glm_mp_learn_loss <- glm_mp$learn_loss[glm_mp$iter])
+
+# prediction on test data
+for (k in 1:K){
+  dat_test[,vname("glm_mu",k)]<-predict(glm_mp$mu_models[[k]][[glm_mp$iter]],newdata = Xtest)
+  dat_test[,vname("glm_sigma",k)]<-glm_mp$sigma[k]
+}
+dat_test[,vname2("glm_p",K)]<-predict(glm_mp$p_models[[glm_mp$iter]],newdata = Xtest,type="probs")
+## test loss
+(glm_mp_test_loss <-neg_ll(Ytest, dat_test[, vname2("glm_mu",K)], dat_test[, vname2("glm_sigma",K)], dat_test[, vname2("glm_p",K)]))
+glm_null_test_loss3
+true_test_loss
+## test mse
+dat_test$glm_mu<-apply((dat_test[,vname2("glm_mu",K)]*dat_test[,vname2("glm_p",K)]),1,sum)
+(glm_mp_test_mse<-mean((dat_test$Y-dat_test$glm_mu)^2))
+glm_null_test_mse3
+true_test_mse
+```
+
+## GLM-3M (not used in the paper)
+```{r, eval=F}
+X<-dat[,vname2("X",6)]
+Y<-dat$Y
+Xtest<-dat_test[,vname2("X",6)]
+Ytest<-dat_test$Y
+structure<-"mu"
+trace<-T
+time_temp<-proc.time()
+glm_m<-EM_gaussian(X=X, Y=Y, K=K, M0=M0, structure=structure, trace=trace, patience=patience)
+(proc.time()-time_temp)
+
+# trace plot of loss
+plot(glm_m$learn_loss,type="l",ylim=ylim_0)
+(glm_m_learn_loss <- glm_m$learn_loss[glm_m$iter])
+
+# prediction on test data
+for (k in 1:K){
+  dat_test[,vname("glm_mu",k)]<-predict(glm_m$mu_models[[k]][[glm_m$iter]],newdata = Xtest)
+  dat_test[,vname("glm_sigma",k)]<-glm_m$sigma[k]
+}
+dat_test[,vname2("glm_p",K)]<-predict(glm_m$p_models[[glm_m$iter]],newdata = data.frame(rep(1,nrow(dat_test))),type="probs")
+## test loss
+(glm_m_test_loss <-neg_ll(Ytest, dat_test[, vname2("glm_mu",K)], dat_test[, vname2("glm_sigma",K)], dat_test[, vname2("glm_p",K)]))
+glm_mp_test_loss
+glm_null_test_loss3
+true_test_loss
+## test mse
+dat_test$glm_mu<-apply((dat_test[,vname2("glm_mu",K)]*dat_test[,vname2("glm_p",K)]),1,sum)
+(glm_m_test_mse<-mean((dat_test$Y-dat_test$glm_mu)^2))
+glm_mp_test_mse
+glm_null_test_mse3
+true_test_mse
+```
+
+## GLM-3P
+```{r}
+X<-dat[,vname2("X",6)]
+Y<-dat$Y
+Xtest<-dat_test[,vname2("X",6)]
+Ytest<-dat_test$Y
+structure<-"p"
+trace<-T
+time_temp<-proc.time()
+glm_p<-EM_gaussian(X=X, Y=Y, K=K, M0=M0, structure=structure, trace=trace, patience=patience)
+(proc.time()-time_temp)
+
+# trace plot of loss
+plot(glm_p$learn_loss,type="l",ylim=ylim_0)
+(glm_p_learn_loss <- glm_p$learn_loss[glm_p$iter])
+
+# prediction on test data
+for (k in 1:K){
+  dat_test[,vname("glm_mu",k)]<-predict(glm_p$mu_models[[k]][[glm_p$iter]],newdata = data.frame(rep(1,nrow(dat_test))))
+  dat_test[,vname("glm_sigma",k)]<-glm_p$sigma[k]
+}
+dat_test[,vname2("glm_p",K)]<-predict(glm_p$p_models[[glm_p$iter]],newdata = Xtest,type="probs")
+## test loss 
+(glm_p_test_loss <-neg_ll(Ytest, dat_test[, vname2("glm_mu",K)], dat_test[, vname2("glm_sigma",K)], dat_test[, vname2("glm_p",K)]))
+# glm_mp_test_loss
+glm_null_test_loss3
+true_test_loss
+## test mse
+dat_test$glm_mu_3P<-apply((dat_test[,vname2("glm_mu",K)]*dat_test[,vname2("glm_p",K)]),1,sum)
+(glm_p_test_mse<-mean((dat_test$Y-dat_test$glm_mu_3P)^2))
+# glm_mp_test_mse
+glm_null_test_mse3
+true_test_mse
+```
+
+## Trace plot of loss (NULL-3, GLM-3,3M,3P)
+```{r, eval=F}
+if (draw_figure==T) png("./plots/1-glm-loss3.png")
+matplot(cbind(glm_null3$learn_loss,glm_mp$learn_loss,glm_m$learn_loss,glm_p$learn_loss),lty=1:4,col=1:4,type="l",ylim=ylim_0,xlab="EM iterations",ylab="learning loss")
+legend("topright",c("null","both","mean","mixing probs"),lty=1:4,col=1:4)
+if (draw_figure==T) dev.off()
+```
+
+# BST-1M (K=1)
+```{r}
+train_rows<-(1:nrow(X))[-valid_rows]
+X<-dat[train_rows,vname2("X",6)]
+Y<-dat$Y[train_rows]
+Xval<-dat[valid_rows,vname2("X",6)]
+Yval<-dat$Y[valid_rows]
+Xtest<-dat_test[,vname2("X",6)]
+Ytest<-dat_test$Y
+M0<-100
+param<-list(max_depth=5, eta =0.1, objective="reg:squarederror")
+dtrain<-xgb.DMatrix(data=as.matrix(X), label = Y)
+dvalid<-xgb.DMatrix(data=as.matrix(Xval), label= Yval)
+dtest<-xgb.DMatrix(data=as.matrix(Xtest))
+watchlist=list(train=dtrain, eval= dvalid)
+bst_m0 <-xgb.train(param, dtrain, nrounds=100,verbose = 1,watchlist,early_stopping_rounds = 2)
+
+# prediction on test data
+dat_test$bst_mu_1M<-predict(bst_m0,newdata = dtest)
+dat_test$bst_sigma0<-sqrt(mean((dat_test$Y-dat_test$bst_mu_1M)^2))
+(bst_m0_test_loss<--mean(dnorm(dat_test$Y,dat_test$bst_mu_1M,sd=dat_test$bst_sigma0,log = T)))
+(bst_m0_test_mse<-mean((dat_test$Y-dat_test$bst_mu_1M)^2))
+xgb.importance(feature_names=X_ind$X,bst_m0)
+```
+
+# GLM-1M (K=1)
+```{r}
+X<-dat[,vname2("X",6)]
+Y<-dat$Y
+Xtest<-dat_test[,vname2("X",6)]
+Ytest<-dat_test$Y
+glm_m0 <-glm(Y ~ ., data=X)
+
+# prediction on test data
+dat_test$glm_mu_1M<-predict(glm_m0, newdata = Xtest)
+dat_test$glm_sigma0<-sqrt(mean((dat_test$Y-dat_test$glm_mu_1M)^2))
+(glm_m0_test_loss<--mean(dnorm(dat_test$Y,dat_test$glm_mu_1M,sd=dat_test$glm_sigma0,log = T)))
+(glm_m0_test_mse<-mean((dat_test$Y-dat_test$glm_mu_1M)^2))
+bst_m0_test_mse
+```
+
+# Model comparison
+```{r}
+cor_pearson<-round(cor(dat_test[,c("true_mu","bst_mean_5P","bst_mu_3P","bst_mu_3","bst_mu_1M","glm_mu_3P", "glm_mu_1M")])[1,-1],4)
+cor_kendall<-round(cor(dat_test[,c("true_mu","bst_mean_5P","bst_mu_3P","bst_mu_3", "bst_mu_1M","glm_mu_3P","glm_mu_1M")],method = "kendall")[1,-1],4)
+cor_spearman<-round(cor(dat_test[,c("true_mu","bst_mean_5P","bst_mu_3P","bst_mu_3", "bst_mu_1M","glm_mu_3P","glm_mu_1M")], method ="spearman")[1,-1],4)
+
+result_mat <-
+  data.frame(
+    model = c(
+      "BST-5P",
+      "BST-3P",
+      "BST-3",
+      "BST-1M",
+      "GLM-3P",
+      "GLM-1M",
+      "NULL-3",
+      "true"
+    ),
+    loss = round(c(
+      bst_p_test_loss,
+      bst_p_test_loss3,
+      bst_mp_test_loss,
+      bst_m0_test_loss,
+      glm_p_test_loss,
+      glm_m0_test_loss,
+      glm_null_test_loss3,
+      true_test_loss
+    ),4),
+    mse = round(c(
+      bst_p_test_mse,
+      bst_p_test_mse3,
+      bst_mp_test_mse,
+      bst_m0_test_mse,
+      glm_p_test_mse,
+      glm_m0_test_mse,
+      glm_null_test_mse3,
+      true_test_mse
+    ),4),
+    cor_pearson=c(cor_pearson,NA,NA),
+    cor_kendall=c(cor_kendall,NA,NA),
+    cor_spearman=c(cor_spearman,NA,NA)
+    )
+
+result_mat
+if (draw_figure==T) write.csv(result_mat,"./plots/1-result_mat.csv")
+```
+

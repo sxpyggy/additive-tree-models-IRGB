@@ -1,0 +1,386 @@
+---
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+# Preliminary analysis
+```{r}
+rm(list=ls())
+library("cplm")
+source("2_zip_bst.R")
+draw_figure<-F
+data(AutoClaim)
+str(AutoClaim)
+summary(AutoClaim)
+names(AutoClaim)
+var_names<-c("REVOLKED","INCOME","GENDER", "MAX_EDUC", "JOBCLASS", "MARRIED", "PARENT1", "AGE", "CAR_TYPE", "RED_CAR", "CAR_USE", "AREA", "MVR_PTS")
+# var_names<-c("REVOLKED","INCOME","GENDER", "MAX_EDUC", "JOBCLASS", "MARRIED", "PARENT1", "AGE", "CAR_TYPE", "RED_CAR", "CAR_USE", "AREA", "MVR_PTS", "KIDSDRIV", "TRAVTIME", "BLUEBOOK", "RETAINED", "NPOLICY", "HOMEKIDS")
+dat<-AutoClaim[AutoClaim$IN_YY==T,c("CLM_FREQ5",var_names)]
+str(dat)
+summary(dat)
+names(dat)[1]<-"y"
+dat<-dat[order(dat$y),]
+dat$ind<-rep(1:5,round(nrow(dat)/5,0)+1)[1:nrow(dat)]
+dat_learn<-dat
+dat_test<-AutoClaim[AutoClaim$IN_YY==F,c("CLM_FREQ5",var_names)]
+dat_test<-dat_test[is.na(dat_test$INCOME)==F,]
+summary(dat_test);nrow(dat_test)
+names(dat_test)[1]<-"y"
+table(dat$y)
+round(table(dat_learn$y)/nrow(dat_learn),2)
+round(table(dat_test$y)/nrow(dat_test),2)
+# estimated prob of zeros from poisson
+exp(-mean(dat_learn$y))
+## empirical proportion of zeros 
+(zero_true<-sum(dat_test$y==0)/length(dat_test$y))
+# histogram of N
+if (draw_figure==T) png("./plots/2-hist_poisson_emp.png")
+barplot(table(dat$y), main="",xlab="N", ylab="frequency")
+box()
+if (draw_figure==T)  dev.off()
+```
+
+# Boosting
+```{r}
+valid_rows<-which(dat_learn$ind==5)
+pi00<-sum(dat_learn$y==0)/nrow(dat_learn)
+pi0<-rep(pi00, nrow(dat_learn))
+lambda00<-mean(dat_learn$y)
+lambda0<-rep(lambda00, nrow(dat_learn))
+M0<-500
+n_tree_lambda<-1
+maxdepth_lambda<-1
+eta_lambda<-0.1
+n_tree_pi<-1
+maxdepth_pi<-1
+eta_pi<-0.1
+trace<-TRUE
+patience<-5
+var_names<-var_names
+```
+
+## BST
+```{r}
+structure<-"both"
+bst_both<-EB_zip(dat_learn, valid_rows, var_names,lambda0, pi0, M0,
+                          n_tree_lambda, maxdepth_lambda, eta_lambda,
+                          n_tree_pi, maxdepth_pi, eta_pi,
+                          structure, trace, patience)
+matplot(cbind(bst_both$train_loss,bst_both$valid_loss),lty=c(1,1),col=c("red","blue"),type="l")
+
+# bst_both
+dat_test$lambda_bst<-rep(lambda00, nrow(dat_test))
+dat_test$pi_bst<-rep(pi00, nrow(dat_test))
+for (m in 1:which.min(bst_both$valid_loss)){
+  dtest_lambda<-xgb.DMatrix(data=sparse.model.matrix(~., data=dat_test[,var_names]), base_margin=log(dat_test$lambda_bst))
+  dtest_pi<-xgb.DMatrix(data=sparse.model.matrix(~., data=dat_test[,var_names]), base_margin=p_linear(dat_test$pi_bst))
+  dat_test$lambda_bst<-predict(bst_both$lambda_models[[m]],newdata=dtest_lambda)
+  dat_test$pi_bst<-predict(bst_both$pi_models[[m]],newdata=dtest_pi)
+}
+## test loss
+(loss_bst_both<-mean(neg_ll(dat_test$y,dat_test$pi_bst,dat_test$lambda_bst)))
+## estimated proportion of zeros
+(zero_bst_both<-mean(dat_test$pi_bst+(1-(dat_test$pi_bst))*exp(-(dat_test$lambda_bst))))
+## poisson loss
+dat_test$pi_bst0<-0
+dat_test$lambda_bst0<-(1-dat_test$pi_bst)*dat_test$lambda_bst
+(loss0_bst_both<-mean(neg_ll(dat_test$y,dat_test$pi_bst0,dat_test$lambda_bst0)))
+```
+
+## BST-lambda, BST-lambda-pi
+```{r}
+structure<-"lambda"
+bst_lambda<-
+  EB_zip(dat_learn, valid_rows, var_names, lambda0, pi0, M0, 
+         n_tree_lambda, maxdepth_lambda, eta_lambda,
+         n_tree_pi, maxdepth_pi, eta_pi,
+         structure, trace, patience)
+matplot(cbind(bst_lambda$train_loss,bst_lambda$valid_loss),lty=c(1,1),col=c("red","blue"),type="l")
+structure<-"pi"
+bst_lambda_pi<-
+  EB_zip(dat_learn, valid_rows, var_names, bst_lambda$lambda_hat, bst_lambda$pi_hat, M0,
+         n_tree_lambda, maxdepth_lambda, eta_lambda,
+         n_tree_pi, maxdepth_pi, eta_pi,
+         structure, trace, patience)
+matplot(cbind(bst_lambda_pi$train_loss,bst_lambda_pi$valid_loss),lty=c(1,1),col=c("red","blue"),type="l")
+
+# bst_lambda
+dat_test$lambda_bst<-rep(lambda00, nrow(dat_test))
+dat_test$pi_bst<-rep(pi00, nrow(dat_test))
+for (m in 1:which.min(bst_lambda$valid_loss)){
+  dtest_lambda<-xgb.DMatrix(data=sparse.model.matrix(~., data=dat_test[,var_names]), base_margin=log(dat_test$lambda_bst))
+  dtest_pi<-xgb.DMatrix(data=as.matrix(rep(1,nrow(dat_test))), base_margin=p_linear(dat_test$pi_bst))
+  dat_test$lambda_bst<-predict(bst_lambda$lambda_models[[m]],newdata=dtest_lambda)
+  dat_test$pi_bst<-predict(bst_lambda$pi_models[[m]],newdata=dtest_pi)
+}
+## test loss
+(loss_bst_lambda<-mean(neg_ll(dat_test$y,dat_test$pi_bst,dat_test$lambda_bst)))
+## estimated proportion of zeros
+(zero_bst_lambda<-mean(dat_test$pi_bst+(1-(dat_test$pi_bst))*exp(-(dat_test$lambda_bst))))
+## poisson loss
+dat_test$pi_bst0<-0
+dat_test$lambda_bst0<-(1-dat_test$pi_bst)*dat_test$lambda_bst
+(loss0_bst_lambda<-mean(neg_ll(dat_test$y,dat_test$pi_bst0,dat_test$lambda_bst0)))
+
+# bst_lambda_pi
+for (m in 1:which.min(bst_lambda_pi$valid_loss)){
+  dtest_lambda<-xgb.DMatrix(data=as.matrix(rep(1,nrow(dat_test))), base_margin=log(dat_test$lambda_bst))
+  dtest_pi<-xgb.DMatrix(data=sparse.model.matrix(~., data=dat_test[,var_names]), base_margin=p_linear(dat_test$pi_bst))
+  dat_test$lambda_bst<-predict(bst_lambda_pi$lambda_models[[m]],newdata=dtest_lambda)
+  dat_test$pi_bst<-predict(bst_lambda_pi$pi_models[[m]],newdata=dtest_pi)
+}
+## test loss
+(loss_bst_lambda_pi<-mean(neg_ll(dat_test$y,dat_test$pi_bst,dat_test$lambda_bst)))
+```
+
+### Variable relative importance
+```{r}
+X_names<-dimnames(sparse.model.matrix(~., data=dat_test[,var_names]))[[2]][-1]
+X_ind<-data.frame(X=X_names,ind=1:length(X_names))
+vi_lambda<-data.frame(matrix(0,nrow=length(bst_lambda$valid_loss),ncol=length(X_names)))
+names(vi_lambda)<-X_names
+for (m in 1:length(bst_lambda$valid_loss)){
+  boost_model<-bst_lambda$lambda_models[[m]]
+  tree_bst<- tryCatch(xgb.model.dt.tree(model = boost_model), error = function(e) NULL)
+  if (is.null(tree_bst)==F){
+    gain_mat<-aggregate(Quality ~ Feature, data=tree_bst, FUN=sum)
+    gain_mat<-gain_mat[-which(gain_mat$Feature=="Leaf"),]
+    gain_mat<-merge(X_ind,gain_mat,by.x="X",by.y="Feature",all.x=T)
+    gain_mat$Quality[is.na(gain_mat$Quality)]<-0
+    vi_lambda[m,]<-gain_mat$Quality[order(gain_mat$ind)]
+  }
+}
+
+(vi<-round(apply(vi_lambda,2,sum)/sum(apply(vi_lambda,2,sum))*100,2))
+sort(vi)
+# write.csv(vi,"./plots/2-zip-imp.csv")
+```
+
+## BST-pi, BST-pi-lambda
+```{r}
+structure<-"pi"
+bst_pi<-
+  EB_zip(dat_learn, valid_rows, var_names, lambda0, pi0, M0,
+         n_tree_lambda, maxdepth_lambda, eta_lambda,
+         n_tree_pi, maxdepth_pi, eta_pi,
+         structure, trace, patience)
+matplot(cbind(bst_pi$train_loss,bst_pi$valid_loss),lty=c(1,1),col=c("red","blue"),type="l")
+structure<-"lambda"
+bst_pi_lambda<-
+  EB_zip(dat_learn, valid_rows, var_names, bst_pi$lambda_hat, bst_pi$pi_hat, M0,
+         n_tree_lambda, maxdepth_lambda, eta_lambda,
+         n_tree_pi, maxdepth_pi, eta_pi,
+         structure, trace, patience)
+matplot(cbind(bst_pi_lambda$train_loss,bst_pi_lambda$valid_loss),lty=c(1,1),col=c("red","blue"),type="l")
+
+# bst_pi
+dat_test$lambda_bst<-rep(lambda00, nrow(dat_test))
+dat_test$pi_bst<-rep(pi00, nrow(dat_test))
+for (m in 1:which.min(bst_pi$valid_loss)){
+  dtest_lambda<-xgb.DMatrix(data=as.matrix(rep(1,nrow(dat_test))), base_margin=log(dat_test$lambda_bst))
+  dtest_pi<-xgb.DMatrix(data=sparse.model.matrix(~., data=dat_test[,var_names]), base_margin=p_linear(dat_test$pi_bst))
+  dat_test$lambda_bst<-predict(bst_pi$lambda_models[[m]],newdata=dtest_lambda)
+  dat_test$pi_bst<-predict(bst_pi$pi_models[[m]],newdata=dtest_pi)
+}
+## test loss
+(loss_bst_pi<-mean(neg_ll(dat_test$y,dat_test$pi_bst,dat_test$lambda_bst)))
+## poisson loss
+dat_test$pi_bst0<-0
+dat_test$lambda_bst0<-(1-dat_test$pi_bst)*dat_test$lambda_bst
+(loss0_bst_pi<-mean(neg_ll(dat_test$y,dat_test$pi_bst0,dat_test$lambda_bst0)))
+## estimated proportion of zeros
+(zero_bst_pi<-mean(dat_test$pi_bst+(1-(dat_test$pi_bst))*exp(-(dat_test$lambda_bst))))
+
+# bst_pi_lambda
+for (m in 1:which.min(bst_pi_lambda$valid_loss)){
+  dtest_lambda<-xgb.DMatrix(data=sparse.model.matrix(~., data=dat_test[,var_names]), base_margin=log(dat_test$lambda_bst))
+  dtest_pi<-xgb.DMatrix(data=as.matrix(rep(1,nrow(dat_test))), base_margin=p_linear(dat_test$pi_bst))
+  dat_test$lambda_bst<-predict(bst_pi_lambda$lambda_models[[m]],newdata=dtest_lambda)
+  dat_test$pi_bst<-predict(bst_pi_lambda$pi_models[[m]],newdata=dtest_pi)
+}
+## test loss
+(loss_bst_pi_lambda<-mean(neg_ll(dat_test$y,dat_test$pi_bst,dat_test$lambda_bst)))
+## poisson loss
+dat_test$pi_bst0<-0
+dat_test$lambda_bst0<-(1-dat_test$pi_bst)*dat_test$lambda_bst
+(loss0_bst_pi_lambda<-mean(neg_ll(dat_test$y,dat_test$pi_bst0,dat_test$lambda_bst0)))
+## estimated proportion of zeros
+(zero_bst_pi_lambda<-mean(dat_test$pi_bst+(1-(dat_test$pi_bst))*exp(-(dat_test$lambda_bst))))
+
+# test loss comparison
+(test_loss_comparison<-round(c(loss_bst_both,loss_bst_lambda,loss_bst_lambda_pi,loss_bst_pi,loss_bst_pi_lambda),4))
+# write.csv(test_loss_comparison, "./plots/2-zip-bst-loss.csv")
+```
+
+### Variable relative importance
+```{r}
+X_names<-dimnames(sparse.model.matrix(~., data=dat_test[,var_names]))[[2]][-1]
+X_ind<-data.frame(X=X_names,ind=1:length(X_names))
+vi_lambda<-data.frame(matrix(0,nrow=length(bst_pi$valid_loss),ncol=length(X_names)))
+names(vi_lambda)<-X_names
+for (m in 1:length(bst_pi$valid_loss)){
+  boost_model<-bst_pi$pi_models[[m]]
+  tree_bst<- tryCatch(xgb.model.dt.tree(model = boost_model), error = function(e) NULL)
+  if (is.null(tree_bst)==F){
+    gain_mat<-aggregate(Quality ~ Feature, data=tree_bst, FUN=sum)
+    gain_mat<-gain_mat[-which(gain_mat$Feature=="Leaf"),]
+    gain_mat<-merge(X_ind,gain_mat,by.x="X",by.y="Feature",all.x=T)
+    gain_mat$Quality[is.na(gain_mat$Quality)]<-0
+    vi_lambda[m,]<-gain_mat$Quality[order(gain_mat$ind)]
+  }
+}
+
+(vi<-round(apply(vi_lambda,2,sum)/sum(apply(vi_lambda,2,sum))*100,2))
+sort(vi)
+# write.csv(vi,"./plots/2-zip-imp.csv")
+```
+
+# Poisson GBDT
+```{r}
+param<-list(max_depth=6, eta =0.1, objective="count:poisson")
+dtrain<-xgb.DMatrix(data=sparse.model.matrix(~.,data=dat[dat$ind<5, var_names]), label = dat$y[dat$ind<5])
+dvalid<-xgb.DMatrix(data=sparse.model.matrix(~., data=dat[dat$ind==5, var_names]), label = dat$y[dat$ind==5])
+dtest<-xgb.DMatrix(data=sparse.model.matrix(~.,data=dat_test[, var_names]))
+watchlist=list(train=dtrain,eval=dvalid)
+bst_poi <- xgb.train(param, dtrain, nrounds=100, verbose = 1, watchlist, early_stopping_rounds = 5)
+dat_test$lambda_boost0 <- predict(bst_poi,type="response", newdata = dtest)
+dat_test$pi_bst<-0
+(loss0_BST0<-mean(neg_ll(dat_test$y,dat_test$pi_bst,dat_test$lambda_boost0))) # under Poisson loss
+(zero_bst_0<-mean(exp(-dat_test$lambda_boost0)))
+```
+
+# GLM
+```{r}
+#var_names_glm<-c("CAR_USE","MARRIED","AREA","GENDER","INCOME")
+var_names_glm<-c("CAR_USE","MARRIED","AREA","GENDER","MVR_PTS","INCOME")
+dat<-AutoClaim[AutoClaim$IN_YY==T,c("CLM_FREQ5",var_names_glm)]
+str(dat)
+summary(dat)
+names(dat)[1]<-"y"
+dat<-dat[order(dat$y),]
+dat$ind<-rep(1:5,round(nrow(dat)/5,0)+1)[1:nrow(dat)]
+dat_learn<-dat
+dat_test<-AutoClaim[AutoClaim$IN_YY==F,c("CLM_FREQ5",var_names_glm)]
+dat_test<-dat_test[is.na(dat_test$INCOME)==F,]
+summary(dat_test)
+names(dat_test)[1]<-"y"
+table(dat$y)
+round(table(dat_learn$y)/nrow(dat_learn),2)
+round(table(dat_test$y)/nrow(dat_test),2)
+```
+
+## NULL
+### on the original data
+```{r}
+null_mle<-mle_zip(dat_learn$y,iter = 30)
+plot(null_mle$loss,type="l")
+# learn loss
+min(null_mle$loss)
+# test loss
+dat_test$pi_null<-null_mle$pi_hat
+dat_test$lambda_null<-null_mle$lambda_hat
+(loss_null<-mean(neg_ll(dat_test$y,dat_test$pi_null,dat_test$lambda_null)))
+# estimated proportion of zeros
+(zero_glm_null<-sum(dat_test$pi_null+(1-dat_test$pi_null)*exp(-dat_test$lambda_null))/length(dat_test$y))
+
+# null poisson model
+dat_test$pi_null0<-0
+dat_test$lambda_null0<-(1-dat_test$pi_null)*dat_test$lambda_null
+(loss0_null<-mean(neg_ll(dat_test$y,dat_test$pi_null0,dat_test$lambda_null0)))
+```
+
+### on the augmented data
+```{r}
+names(dat_learn)
+M0<-15
+structure="null"
+glm_null<-EM_zip(dat_learn,var_names=var_names_glm,M0,structure)
+plot(glm_null$learn_loss,type="l")
+min(glm_null$learn_loss)
+min(null_mle$loss)
+# test loss
+dat_test$pi_null2<-predict(glm_null$glm_ber,newdata = dat_test,type="response")
+dat_test$lambda_null2<-predict(glm_null$glm_poi,newdata = dat_test,type="response")
+(loss_null2<-mean(neg_ll(dat_test$y,dat_test$pi_null2,dat_test$lambda_null2)))
+loss_null
+```
+
+## GLM
+```{r}
+M0<-20
+structure="both"
+glm_both<-EM_zip(dat_learn,var_names=var_names_glm,M0,structure)
+# learn loss
+plot(glm_both$learn_loss,type="l")
+# test loss
+dat_test$lambda_glm_both<-predict(glm_both$glm_poi,newdata = dat_test,type = "response")
+dat_test$pi_glm_both<-predict(glm_both$glm_ber,newdata = dat_test,type ="response")
+(loss_glm_both<-mean(neg_ll(dat_test$y,dat_test$pi_glm_both,dat_test$lambda_glm_both)))
+loss_null
+# estimated proportion of zeros
+exp(-mean(dat_test$y))
+sum(dat_test$y==0)/length(dat_test$y)
+(zero_glm_both<-mean(dat_test$pi_glm_both+(1-(dat_test$pi_glm_both))*exp(-(dat_test$lambda_glm_both))))
+# poisson loss
+dat_test$pi_glm0<-0
+dat_test$lambda_glm0<-(1-dat_test$pi_glm_both)*dat_test$lambda_glm_both
+(loss0_glm_both<-mean(neg_ll(dat_test$y,dat_test$pi_glm0,dat_test$lambda_glm0)))
+```
+
+## GLM-lambda
+```{r}
+M0<-20
+structure="lambda"
+glm_lambda<-EM_zip(dat_learn, var_names=var_names_glm, M0, structure)
+summary(glm_lambda$glm_poi)
+summary(glm_lambda$glm_ber)
+1-1/(1+exp(coef(glm_lambda$glm_ber)))
+# learn loss
+plot(glm_lambda$learn_loss,type="l")
+# test loss
+dat_test$lambda_glm_lambda<-predict(glm_lambda$glm_poi,newdata = dat_test,type = "response")
+dat_test$pi_glm_lambda<-predict(glm_lambda$glm_ber,newdata = dat_test,type ="response")
+(loss_glm_lambda<-mean(neg_ll(dat_test$y,dat_test$pi_glm_lambda,dat_test$lambda_glm_lambda)))
+loss_null
+# estimated proportion of zeros
+(zero_glm_lambda<-mean(dat_test$pi_glm_lambda+(1-(dat_test$pi_glm_lambda))*exp(-(dat_test$lambda_glm_lambda))))
+# poisson loss
+dat_test$pi_glm0<-0
+dat_test$lambda_glm0<-(1-dat_test$pi_glm_lambda)*dat_test$lambda_glm_lambda
+(loss0_glm_lambda<-mean(neg_ll(dat_test$y,dat_test$pi_glm0,dat_test$lambda_glm0)))
+loss0_null
+```
+
+## GLM-pi
+```{r}
+M0<-20
+structure="pi"
+glm_pi<-EM_zip(dat_learn, var_names=var_names_glm, M0, structure)
+# learn loss
+plot(glm_pi$learn_loss,type="l")
+# test loss
+dat_test$lambda_glm_pi<-predict(glm_pi$glm_poi,newdata = dat_test,type = "response")
+dat_test$pi_glm_pi<-predict(glm_pi$glm_ber,newdata = dat_test,type ="response")
+(loss_glm_pi<-mean(neg_ll(dat_test$y,dat_test$pi_glm_pi,dat_test$lambda_glm_pi)))
+loss_null
+# estimated proportion of zeros
+(zero_glm_pi<-mean(dat_test$pi_glm_pi+(1-(dat_test$pi_glm_pi))*exp(-(dat_test$lambda_glm_pi))))
+# poisson loss
+dat_test$pi_glm0<-0
+dat_test$lambda_glm0<-(1-dat_test$pi_glm_pi)*dat_test$lambda_glm_pi
+(loss0_glm_pi<-mean(neg_ll(dat_test$y,dat_test$pi_glm0,dat_test$lambda_glm0)))
+```
+
+# Model comparison
+```{r}
+loss_mat<-data.frame(
+  model=c("null","glm_lambda","glm_pi","glm_both","bst_lambda","bst_pi","bst_pi_lambda","GBDT"),
+  negL=c(loss_null,loss_glm_lambda,loss_glm_pi,loss_glm_both,loss_bst_lambda,loss_bst_pi,loss_bst_pi_lambda,NA),loss0=NA)
+loss_mat$loss0<-c(loss0_null,loss0_glm_lambda,loss0_glm_pi,loss0_glm_both,loss0_bst_lambda,loss0_bst_pi,loss0_bst_pi_lambda,loss0_BST0)
+loss_mat$proportion_0<-c(zero_glm_null,zero_glm_lambda,zero_glm_pi,zero_glm_both,zero_bst_lambda,zero_bst_pi,zero_bst_pi_lambda,zero_bst_0)
+loss_mat[,2:4]<-round(loss_mat[,2:4],4)
+loss_mat
+# write.csv(loss_mat,"./plots/2-zip_loss_mat.csv")
+```
+
