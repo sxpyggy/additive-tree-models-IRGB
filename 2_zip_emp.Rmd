@@ -238,12 +238,12 @@ sort(vi)
 
 # Poisson GBDT
 ```{r}
-param<-list(max_depth=6, eta =0.1, objective="count:poisson")
+param<-list(max_depth=3, eta =0.15, objective="count:poisson")
 dtrain<-xgb.DMatrix(data=sparse.model.matrix(~.,data=dat[dat$ind<5, var_names]), label = dat$y[dat$ind<5])
 dvalid<-xgb.DMatrix(data=sparse.model.matrix(~., data=dat[dat$ind==5, var_names]), label = dat$y[dat$ind==5])
 dtest<-xgb.DMatrix(data=sparse.model.matrix(~.,data=dat_test[, var_names]))
 watchlist=list(train=dtrain,eval=dvalid)
-bst_poi <- xgb.train(param, dtrain, nrounds=100, verbose = 1, watchlist, early_stopping_rounds = 5)
+bst_poi <- xgb.train(param, dtrain, nrounds=100, verbose = 1, watchlist, early_stopping_rounds = 20)
 dat_test$lambda_boost0 <- predict(bst_poi,type="response", newdata = dtest)
 dat_test$pi_bst<-0
 (loss0_BST0<-mean(neg_ll(dat_test$y,dat_test$pi_bst,dat_test$lambda_boost0))) # under Poisson loss
